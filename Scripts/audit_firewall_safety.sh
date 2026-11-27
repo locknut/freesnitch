@@ -513,8 +513,8 @@ for restore in 'mgr.isEnabled = loadedEnabled' 'mgr.providerConfiguration = load
 done
 require_text "$FILTER" "watermark.supersedes(decoded)" \
   "the extension can load a saved boot policy older than the last live policy it enforced"
-require_text "$FILTER" "if decision == .accepted { recordLiveWatermark(accepted) }" \
-  "the extension does not remember which live policy it last enforced"
+require_text "$FILTER" "if decision == .accepted, source == .app { recordLiveWatermark(accepted) }" \
+  "the extension does not remember which live policy it last enforced, or records policy the app never saved for the next start"
 enable_body="$(awk '/private func enableFilter\(/ {a=1} a {print} a && /^    }$/ {exit}' "$SYSTEM_EXTENSION_MANAGER")"
 grep -Fq 'persistenceCycle.requestEnable()' <<<"$enable_body" \
   || fail "turning the filter on can save a snapshot kept for a retry instead of the helper's fresh answer"
@@ -1012,6 +1012,28 @@ reject_line="$(printf '%s\n' "$accept_body" | grep -nF 'return false' | head -1 
   || fail "the XPC accept path can resume or accept before peer validation"
 if grep -Fq 'newConnection.resume(); return true' <<<"$accept_body"; then
   fail "the XPC accept path is unconditionally accepting peers"
+fi
+# The helper may deliver policy to the extension, under its own, narrower
+# code requirement, and it never becomes the connection alerts go to. Every
+# other peer still has to pass the GUI requirement.
+[[ "$(grep -cE 'fromHelper[[:space:]]*=' <<<"$accept_body")" == 1 ]] \
+  && grep -Fq 'let fromHelper = XPCPeerValidator.isTrustedHelper(newConnection)' <<<"$accept_body" \
+  || fail "the XPC accept path decides the helper peer by anything but its own code requirement"
+helper_branch_line="$(printf '%s\n' "$accept_body" | grep -nF 'if !fromHelper {' | head -1 | cut -d: -f1 || true)"
+[[ -n "$helper_branch_line" && -n "$validation_line" ]] && (( helper_branch_line < validation_line )) \
+  || fail "a peer that is not the helper can skip the GUI code requirement"
+[[ "$(grep -cF 'setCurrentConnection(newConnection)' <<<"$accept_body")" == 1 ]] \
+  && grep -Fq 'if !fromHelper && !XPCPeerValidator.isCLI(newConnection) {' <<<"$accept_body" \
+  || fail "the helper or the command line tool can become the connection that answers alerts"
+grep -Fq 'newConnection.exportedObject = ProviderEndpoint(owner: self, source: fromHelper ? .helper : .app)' <<<"$accept_body" \
+  || fail "a snapshot's sender is not fixed when its connection is accepted"
+grep -Fq 'trustedPeer(connection, requirement: requirement(for: [AppConstants.bundleIdHelper]))' "$PEER_VALIDATOR" \
+  || fail "the helper peer is not checked against the helper's code requirement"
+permitted_block="$(awk '/permittedPeerIdentifiers: \[String\] = \[/{f=1; next} f&&/^[[:space:]]*\]/{exit} f{print}' "$PEER_VALIDATOR")"
+grep -Fq 'bundleIdHelper' <<<"$permitted_block" \
+  && fail "the helper identity was added to the peers the helper's own listener accepts"
+if grep -Fq 'NSXPCConnection.current()' "$IPC"; then
+  fail "a snapshot's sender is derived per message instead of at accept"
 fi
 require_text "$APP_STATE" "IPCConnection.shared.sendSnapshot(data)" \
   "the GUI does not push snapshots over XPC"

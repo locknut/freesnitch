@@ -39,6 +39,9 @@ struct Verify {
     static let corp = "5F1D7C2A-0000-4000-8000-00000000C0DE"
     static let ikev2 = "9A8B7C6D-0000-4000-8000-0000000001E2"
 
+    static func r4(_ i: String?) -> [String?] { Array(repeating: i, count: TunnelProbe.standard.ipv4.count) }
+    static func r6(_ i: String?) -> [String?] { Array(repeating: i, count: TunnelProbe.standard.ipv6.count) }
+
     static func physical() -> [String: Any] {
         [
             "State:/Network/Service/\(ethernet)/IPv4": ["InterfaceName": "en0", "Addresses": ["192.168.96.20"], "Router": "192.168.96.1"],
@@ -62,7 +65,7 @@ struct Verify {
 
     static func connected() -> TunnelEnvironment {
         TunnelEnvironment(store: warpStore(), interfaces: ["en0": en0, "utun0": utun0, "utun1": appleUtun],
-                          ipv4ProbeRoute: "utun0", ipv6ProbeRoute: "utun0")
+                          ipv4ProbeRoutes: r4("utun0"), ipv6ProbeRoutes: r6("utun0"))
     }
 
     static func main() {
@@ -80,7 +83,7 @@ struct Verify {
               TunnelStatus.evaluate(withSystemTunnel).services.map(\.id) == [warp])
 
         let disconnected = TunnelEnvironment(store: physical(), interfaces: ["en0": en0, "utun1": appleUtun],
-                                             ipv4ProbeRoute: "en0", ipv6ProbeRoute: nil)
+                                             ipv4ProbeRoutes: r4("en0"), ipv6ProbeRoutes: r6(nil))
         let down = TunnelStatus.evaluate(disconnected)
         check("disconnected: no tunnel service at all", down.services.isEmpty && down.connected.isEmpty)
         check("DNS-only mode (client reports connected, no tunnel) reads the same", !down.anyConnected)
@@ -88,7 +91,7 @@ struct Verify {
         var connectingStore = warpStore()
         connectingStore[VPNStatus.globalDNSKey] = ["ServerAddresses": ["1.1.1.1"]]
         let connecting = TunnelEnvironment(store: connectingStore, interfaces: ["en0": en0, "utun0": utun0],
-                                           ipv4ProbeRoute: "utun0", ipv6ProbeRoute: "utun0")
+                                           ipv4ProbeRoutes: r4("utun0"), ipv6ProbeRoutes: r6("utun0"))
         check("connecting already owns the route (the debouncer holds it back)", TunnelStatus.evaluate(connecting).connected == [warp])
 
         // 2. Each condition on its own.
@@ -99,12 +102,12 @@ struct Verify {
         check("an interface that is not up: not connected", TunnelStatus.evaluate(downIf).reasons[warp] == .interfaceDown("utun0"))
         var linkLocal = connected(); linkLocal.interfaces["utun0"] = TunnelInterfaceState(isUp: true, addresses: ["fe80::1%utun0"])
         check("only a link-local address: not connected", TunnelStatus.evaluate(linkLocal).reasons[warp] == .noAddress("utun0"))
-        var v6Leak = connected(); v6Leak.ipv6ProbeRoute = "en0"
+        var v6Leak = connected(); v6Leak.ipv6ProbeRoutes = r6("en0")
         check("IPv6 default traffic around the tunnel: not connected",
               TunnelStatus.evaluate(v6Leak).reasons[warp] == .notDefaultRoute(family: .ipv6, interface: "en0"))
-        var noV6 = connected(); noV6.ipv6ProbeRoute = nil
+        var noV6 = connected(); noV6.ipv6ProbeRoutes = r6(nil)
         check("no IPv6 route at all is fine", TunnelStatus.evaluate(noV6).connected == [warp])
-        var noV4 = connected(); noV4.ipv4ProbeRoute = nil
+        var noV4 = connected(); noV4.ipv4ProbeRoutes = r4(nil)
         check("no IPv4 route: not connected", TunnelStatus.evaluate(noV4).reasons[warp] == .notDefaultRoute(family: .ipv4, interface: nil))
         var unreadable = connected(); unreadable.readFailure = "IPv4 route: no answer"
         let failed = TunnelStatus.evaluate(unreadable)
@@ -118,7 +121,7 @@ struct Verify {
         splitStore["Setup:/Network/Service/\(corp)"] = ["UserDefinedName": "Corp"]
         let split = TunnelStatus.evaluate(TunnelEnvironment(
             store: splitStore, interfaces: ["en0": en0, "utun5": TunnelInterfaceState(isUp: true, addresses: ["10.8.0.2"])],
-            ipv4ProbeRoute: "en0", ipv6ProbeRoute: nil))
+            ipv4ProbeRoutes: r4("en0"), ipv6ProbeRoutes: r6(nil)))
         check("a split-tunnel VPN is listed by its name", split.services == [TunnelService(id: corp, name: "Corp")])
         check("but is not connected for full-tunnel purposes",
               split.connected.isEmpty && split.reasons[corp] == .notDefaultRoute(family: .ipv4, interface: "en0"))
@@ -128,9 +131,38 @@ struct Verify {
         for (key, value) in splitStore where key.contains(corp) { both[key] = value }
         let two = TunnelStatus.evaluate(TunnelEnvironment(
             store: both, interfaces: ["en0": en0, "utun0": utun0, "utun5": TunnelInterfaceState(isUp: true, addresses: ["10.8.0.2"])],
-            ipv4ProbeRoute: "utun0", ipv6ProbeRoute: "utun0"))
+            ipv4ProbeRoutes: r4("utun0"), ipv6ProbeRoutes: r6("utun0")))
         check("both are listed, in id order", two.services.map(\.id) == [corp, warp].sorted())
         check("only the one that owns the default route is connected", two.connected == [warp])
+
+        // 4b. A split tunnel whose routes happen to include one probe address
+        //     does not count: every IPv4 probe must go through it.
+        var onePrefix = TunnelEnvironment(
+            store: splitStore, interfaces: ["en0": en0, "utun5": TunnelInterfaceState(isUp: true, addresses: ["10.8.0.2"])],
+            ipv4ProbeRoutes: ["utun5", "en0", "en0"], ipv6ProbeRoutes: r6(nil))
+        check("a split tunnel routing only one probe address is not connected",
+              TunnelStatus.evaluate(onePrefix).connected.isEmpty
+              && TunnelStatus.evaluate(onePrefix).reasons[corp] == .notDefaultRoute(family: .ipv4, interface: "en0"))
+        onePrefix.ipv4ProbeRoutes = r4("utun5")
+        onePrefix.ipv6ProbeRoutes = ["utun5", nil]
+        check("routing every IPv4 probe and the IPv6 one that has a route counts", TunnelStatus.evaluate(onePrefix).connected == [corp])
+
+        // 4c. A tunnel with no service (set up by a command-line tool) counts
+        //     for "any VPN" only, and only when it owns the default route.
+        let bare = TunnelEnvironment(
+            store: physical(),
+            interfaces: ["en0": en0, "utun7": TunnelInterfaceState(isUp: true, addresses: ["10.99.0.2"]), "utun1": appleUtun],
+            ipv4ProbeRoutes: r4("utun7"), ipv6ProbeRoutes: r6(nil))
+        let bareReading = TunnelStatus.evaluate(bare)
+        check("an unlisted full tunnel counts as a VPN", bareReading.connected == [TunnelStatus.unlistedTunnelID])
+        check("but is not listed as a service", bareReading.services.isEmpty)
+        var idleBare = bare; idleBare.ipv4ProbeRoutes = r4("en0")
+        check("an unlisted tunnel that does not own the default route does not count", TunnelStatus.evaluate(idleBare).connected.isEmpty)
+        var noAddrBare = bare; noAddrBare.interfaces["utun7"] = TunnelInterfaceState(isUp: true, addresses: ["fe80::7%utun7"])
+        check("an unlisted tunnel without a routable address does not count", TunnelStatus.evaluate(noAddrBare).connected.isEmpty)
+        var downBare = bare; downBare.interfaces["utun7"] = TunnelInterfaceState(isUp: false, addresses: ["10.99.0.2"])
+        check("an unlisted tunnel that is down does not count", TunnelStatus.evaluate(downBare).connected.isEmpty)
+        check("a listed service's interface is not counted twice", !TunnelStatus.evaluate(connected()).connected.contains(TunnelStatus.unlistedTunnelID))
 
         // 5. IKEv2 (ipsec interface) full tunnel, and a VPN entry with no tunnel up.
         var ikeStore = physical()
@@ -139,13 +171,13 @@ struct Verify {
         ikeStore["Setup:/Network/Service/\(ikev2)"] = ["UserDefinedName": "Head office"]
         let ike = TunnelStatus.evaluate(TunnelEnvironment(
             store: ikeStore, interfaces: ["en0": en0, "ipsec0": TunnelInterfaceState(isUp: true, addresses: ["172.16.4.9"])],
-            ipv4ProbeRoute: "ipsec0", ipv6ProbeRoute: nil))
+            ipv4ProbeRoutes: r4("ipsec0"), ipv6ProbeRoutes: r6(nil)))
         check("an IKEv2 full tunnel is connected", ike.connected == [ikev2])
         var idle = physical()
         idle["State:/Network/Service/\(ikev2)/VPN"] = ["Status": 0]
         idle["Setup:/Network/Service/\(ikev2)"] = ["UserDefinedName": "Head office"]
         let idleReading = TunnelStatus.evaluate(TunnelEnvironment(store: idle, interfaces: ["en0": en0],
-                                                                  ipv4ProbeRoute: "en0", ipv6ProbeRoute: nil))
+                                                                  ipv4ProbeRoutes: r4("en0"), ipv6ProbeRoutes: r6(nil)))
         check("a configured VPN that is not up is listed but not connected",
               idleReading.services.map(\.id) == [ikev2] && idleReading.connected.isEmpty)
         check("tunnel interface names are recognised",
@@ -154,21 +186,28 @@ struct Verify {
               && !TunnelStatus.isTunnelInterface("utunnel"))
 
         // 6. Debouncing the connected set: removal at once, joining after a hold.
-        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let t0: TimeInterval = 1_000
         func reading(_ ids: Set<String>) -> TunnelReading { TunnelReading(services: [], connected: ids) }
         var d = TunnelSetDebouncer(upHold: 3, upReadings: 2)
         check("starts with nothing", d.connected.isEmpty && d.observe(reading([]), at: t0) == nil)
-        check("a first reading does not join", d.observe(reading([warp]), at: t0) == nil && d.nextDeadline == t0.addingTimeInterval(3))
-        check("a second inside the hold does not join", d.observe(reading([warp]), at: t0.addingTimeInterval(1)) == nil)
-        check("joins once held", d.observe(reading([warp]), at: t0.addingTimeInterval(3)) == [warp])
-        check("a second VPN waits on its own hold", d.observe(reading([warp, corp]), at: t0.addingTimeInterval(4)) == nil)
-        check("one leaving takes effect at once", d.observe(reading([corp]), at: t0.addingTimeInterval(4.5)) == [])
-        check("the other's hold continues", d.observe(reading([corp]), at: t0.addingTimeInterval(7)) == [corp])
-        check("a failed read empties the set at once",
-              d.observe(TunnelReading(services: [], connected: [corp], failure: "x"), at: t0.addingTimeInterval(8)) == [])
+        check("a first reading does not join", d.observe(reading([warp]), at: t0) == nil && d.nextDeadline == t0 + 3)
+        check("a second inside the hold does not join", d.observe(reading([warp]), at: t0 + 1) == nil)
+        check("joins once held", d.observe(reading([warp]), at: t0 + 3) == [warp])
+        check("a second VPN waits on its own hold", d.observe(reading([warp, corp]), at: t0 + 4) == nil)
+        check("one leaving takes effect at once", d.observe(reading([corp]), at: t0 + 4.5) == [])
+        check("the other's hold continues", d.observe(reading([corp]), at: t0 + 7) == [corp])
+        let failedRead = TunnelReading(services: [], connected: [], failure: "x")
+        check("a failed read keeps the set inside its grace", d.observe(failedRead, at: t0 + 8) == nil && d.connected == [corp])
+        check("and asks to be retried soon", d.nextDeadline == t0 + 8.5 && d.isUnsettled)
+        check("a read that works again ends the failure", d.observe(reading([corp]), at: t0 + 8.5) == nil && !d.isUnsettled)
+        _ = d.observe(failedRead, at: t0 + 9)
+        check("still inside the grace, still kept", d.observe(failedRead, at: t0 + 10.5) == nil && d.connected == [corp])
+        check("past the grace the state is unknown: nothing connected", d.observe(failedRead, at: t0 + 11) == [])
+        check("a read that keeps failing past the grace is not retried in a loop", d.nextDeadline == nil)
+        check("a working read after that starts the hold again", d.observe(reading([corp]), at: t0 + 12) == nil)
         var single = TunnelSetDebouncer(upHold: 3, upReadings: 2)
         _ = single.observe(reading([warp]), at: t0)
-        check("one reading is never enough however long ago", single.observe(reading([warp]), at: t0.addingTimeInterval(60)) == [warp])
+        check("one reading is never enough however long ago", single.observe(reading([warp]), at: t0 + 60) == [warp])
 
         // 7. The monitor's first report.
         final class Replay: TunnelEnvironmentReading, @unchecked Sendable {
@@ -176,7 +215,7 @@ struct Verify {
             init(_ env: TunnelEnvironment) { next = env }
             func read(probe: TunnelProbe) -> TunnelEnvironment { next }
         }
-        final class Clock: @unchecked Sendable { var now: Date; init(_ d: Date) { now = d } }
+        final class Clock: @unchecked Sendable { var now: TimeInterval; init(_ d: TimeInterval) { now = d } }
         let clock = Clock(t0)
         let replay = Replay(connected())
         let monitor = TunnelMonitor(reader: replay, pollInterval: 3600, now: { clock.now })
@@ -184,11 +223,11 @@ struct Verify {
         monitor.onChange = { reports.append($0.connected) }
         monitor.evaluate()
         check("a tunnel up at start reports nothing during its hold", reports.isEmpty && monitor.currentState == nil)
-        clock.now = t0.addingTimeInterval(3.2)
+        clock.now = t0 + 3.2
         monitor.evaluate()
         check("and reports it once held", reports == [[warp]] && monitor.currentState?.services.map(\.id) == [warp])
         replay.next = disconnected
-        clock.now = t0.addingTimeInterval(10)
+        clock.now = t0 + 10
         monitor.evaluate()
         check("a disconnect is reported at once", reports == [[warp], []])
         monitor.evaluate()
@@ -199,13 +238,30 @@ struct Verify {
         downStart.evaluate()
         check("nothing up at start is reported at once", downReports == [[]])
 
-        // 8. Routable addresses and CIDR.
+        // 7b. Lifecycle: start/stop, nothing after stop, released when done.
+        weak var released: TunnelMonitor?
+        do {
+            let lifecycle = TunnelMonitor(reader: Replay(disconnected), pollInterval: 3600, now: { clock.now })
+            var reports = 0
+            lifecycle.onChange = { _ in reports += 1 }
+            lifecycle.start(); lifecycle.start()
+            Thread.sleep(forTimeInterval: 0.3)
+            check("start twice runs once and reports once", lifecycle.isRunning && reports == 1)
+            lifecycle.stop()
+            check("stop stops and forgets the state", !lifecycle.isRunning && lifecycle.currentState == nil)
+            lifecycle.start()
+            Thread.sleep(forTimeInterval: 0.3)
+            check("a restart reports afresh", reports == 2)
+            lifecycle.stop()
+            released = lifecycle
+        }
+        check("a stopped monitor is released (no retain cycle through the store callback)", released == nil)
+
+        // 8. Routable addresses.
         check("link-local and loopback are not routable",
               !TunnelStatus.isRoutable("fe80::1%utun0") && !TunnelStatus.isRoutable("127.0.0.1")
               && !TunnelStatus.isRoutable("169.254.1.1") && !TunnelStatus.isRoutable("::1"))
         check("CGNAT and global addresses are", TunnelStatus.isRoutable("100.96.0.7") && TunnelStatus.isRoutable("2606:4700:cf1:1000::3"))
-        check("CIDR matches at the prefix boundary",
-              CIDR.contains("100.96.0.0/12", address: "100.111.255.255") && !CIDR.contains("100.96.0.0/12", address: "100.112.0.1"))
 
         // 9. The VPN banner lists a tunnel service without a VPN entry, by id.
         let vpns = VPNStatus.connectedVPNs(in: warpStore())
@@ -217,7 +273,41 @@ struct Verify {
         let liveReading = TunnelStatus.evaluate(live)
         print("tunnel status harness: this Mac: services \(liveReading.services.map(\.displayName)), connected \(liveReading.connected.sorted())")
         check("the live reader reads the store, interfaces and routes without failing", live.readFailure == nil)
-        check("the live reader finds a route for the IPv4 probe", live.ipv4ProbeRoute != nil)
+        check("the live reader finds a route for every IPv4 probe", live.ipv4ProbeRoutes.allSatisfy { $0 != nil })
+
+        // 11. Other processes cannot make a reading fail: flood the routing
+        //     socket (which any user may write to) while reading. The reader
+        //     must not depend on it.
+        if liveReading.anyConnected {
+            let stop = UnsafeMutablePointer<Int32>.allocate(capacity: 1); stop.pointee = 0
+            for _ in 0..<16 {
+                Thread.detachNewThread {
+                    let fd = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC); shutdown(fd, SHUT_RD)
+                    var sin = sockaddr_in()
+                    sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); sin.sin_family = sa_family_t(AF_INET)
+                    sin.sin_addr.s_addr = inet_addr("9.9.9.9")
+                    var h = rt_msghdr()
+                    h.rtm_msglen = UInt16(MemoryLayout<rt_msghdr>.size + MemoryLayout<sockaddr_in>.size)
+                    h.rtm_version = UInt8(RTM_VERSION); h.rtm_type = UInt8(RTM_GET); h.rtm_addrs = RTA_DST; h.rtm_seq = 7
+                    var m = withUnsafeBytes(of: &h) { Array($0) }; m.append(contentsOf: withUnsafeBytes(of: &sin) { Array($0) })
+                    while stop.pointee == 0 { _ = m.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) } }
+                    close(fd)
+                }
+            }
+            let reader = SystemTunnelEnvironmentReader()
+            var failedReads = 0
+            var changed = 0
+            for _ in 0..<100 {
+                let r = TunnelStatus.evaluate(reader.read(probe: .standard))
+                if r.failure != nil { failedReads += 1 }
+                if r.connected != liveReading.connected { changed += 1 }
+            }
+            stop.pointee = 1
+            check("a routing-socket flood by another process fails no reading (\(failedReads)/100) and changes none (\(changed)/100)",
+                  failedReads == 0 && changed == 0)
+        } else {
+            print("tunnel status harness: no VPN is connected here; the flood check needs one and is skipped")
+        }
 
         if failures > 0 { print("tunnel status harness: \(failures) FAILURES"); exit(1) }
         print("tunnel status harness: PASS (all checks)")

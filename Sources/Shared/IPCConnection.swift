@@ -41,6 +41,9 @@ public final class IPCConnection: NSObject, @unchecked Sendable {
     /// Extension side: invoked when the app pushes a rule set. It returns the
     /// provider's resulting status synchronously so the app can publish it.
     public var onSnapshot: ((Data, SnapshotSource) -> SharedRuleBridge.SnapshotStatus)?
+    /// Extension side: a peer asked which policy is in force (`register`).
+    /// The helper does this between changes instead of resending its policy.
+    public var onCheckIn: ((SnapshotSource) -> Void)?
     /// Extension side: supplies the current status during registration.
     public var snapshotStatus: (() -> SharedRuleBridge.SnapshotStatus)?
     /// App side: the connection made by `register` was interrupted or
@@ -223,9 +226,11 @@ extension IPCConnection: NSXPCListenerDelegate {
             }
         }
         // Extension side: the signed GUI connected. Export ProviderCommunication
-        // and keep the connection so we can call promptUser on it later.
+        // and keep the connection so we can call promptUser on it later. Who
+        // the peer is was decided here, once, from its verified identity, and
+        // travels with every snapshot it sends.
         newConnection.exportedInterface = NSXPCInterface(with: ProviderCommunication.self)
-        newConnection.exportedObject = self
+        newConnection.exportedObject = ProviderEndpoint(owner: self, source: fromHelper ? .helper : .app)
         newConnection.remoteObjectInterface = NSXPCInterface(with: AppCommunication.self)
         newConnection.invalidationHandler = { [weak self, weak newConnection] in
             self?.clearCurrentConnection(newConnection)
@@ -289,9 +294,37 @@ extension IPCConnection: ProviderCommunication {
         snapshotJSON: Data,
         completionHandler: @escaping (Data) -> Void
     ) {
-        let source: SnapshotSource = NSXPCConnection.current().map(XPCPeerValidator.isHelper) == true ? .helper : .app
+        updateSnapshot(snapshotJSON: snapshotJSON, source: .app, completionHandler: completionHandler)
+    }
+
+    fileprivate func updateSnapshot(snapshotJSON: Data, source: SnapshotSource,
+                                    completionHandler: @escaping (Data) -> Void) {
         let status = onSnapshot?(snapshotJSON, source)
             ?? .unavailable(String(localized: "Network extension is not ready to receive rule snapshots."))
         completionHandler(Self.encodeStatus(status))
+    }
+}
+
+/// The object one accepted connection talks to. It carries the source
+/// decided when the connection was accepted, so a snapshot's sender is never
+/// re-derived from the peer's on-disk code later.
+private final class ProviderEndpoint: NSObject, ProviderCommunication {
+    private weak var owner: IPCConnection?
+    private let source: IPCConnection.SnapshotSource
+
+    init(owner: IPCConnection, source: IPCConnection.SnapshotSource) {
+        self.owner = owner
+        self.source = source
+    }
+
+    func register(_ completionHandler: @escaping (Bool, Data) -> Void) {
+        guard let owner else { completionHandler(false, Data()); return }
+        owner.onCheckIn?(source)
+        owner.register(completionHandler)
+    }
+
+    func updateSnapshot(snapshotJSON: Data, completionHandler: @escaping (Data) -> Void) {
+        guard let owner else { completionHandler(Data()); return }
+        owner.updateSnapshot(snapshotJSON: snapshotJSON, source: source, completionHandler: completionHandler)
     }
 }

@@ -121,6 +121,9 @@ final class SystemExtensionManager: NSObject, ObservableObject {
     /// Bounded, spaced automatic recovery from an extension that is holding a
     /// policy it will not let the helper replace (#70).
     private var snapshotRecovery = FilterRestartRecovery()
+    /// Set after asking the helper again for an "older generation" refusal,
+    /// cleared once the extension reports ready.
+    private var refetchedForOlderGeneration = false
     private var filterRestartInFlight = false
     /// Bounded, spaced attempts to register with the extension again after
     /// the link dropped, for example when a filter restart replaced the
@@ -944,6 +947,15 @@ final class SystemExtensionManager: NSObject, ObservableObject {
     /// deliberately does not deactivate the system extension, does not remove
     /// the filter configuration, and never touches the privileged helper.
     private func recoverFromSnapshotRejection(_ snapshotStatus: SharedRuleBridge.SnapshotStatus) {
+        // The helper also delivers policy itself. A copy the app read just
+        // before a change can reach the extension after the helper's newer
+        // one and is refused as older. Ask the helper once more and send
+        // that; only if the extension still refuses is the filter restarted.
+        if snapshotStatus.rejection == .olderGeneration, !refetchedForOlderGeneration {
+            refetchedForOlderGeneration = true
+            state?.syncSharedRules()
+            return
+        }
         switch snapshotRecovery.decide(for: snapshotStatus) {
         case .notNeeded, .waitForCooldown:
             return
@@ -1047,6 +1059,7 @@ final class SystemExtensionManager: NSObject, ObservableObject {
             // that would hand back the restart limit (#70) and the reconnect
             // budget before the live rules were accepted (#212).
             if delivered {
+                refetchedForOlderGeneration = false
                 snapshotRecovery.noteHealthy()
                 ipcReconnect.policyDelivered()
                 state?.recordFilterRecovery(nil)

@@ -2,76 +2,126 @@ import Foundation
 
 /// Hands the helper's authoritative policy to the network extension directly,
 /// over the same XPC service the app uses, so a policy change made in the
-/// helper (a tunnel switch, an MDM update) reaches the filter while no app is
-/// running. The app keeps relaying policy as before; the extension orders
-/// both by (epoch, generation), so whichever arrives second is idempotent or
-/// ignored.
+/// helper (a VPN trigger) reaches the filter while no app is running. The app
+/// keeps relaying policy as before; the extension orders both by (epoch,
+/// generation).
+///
+/// It sends the policy on every change. Between changes it only asks the
+/// extension which policy it holds (a small status reply) every
+/// `checkInterval`, and sends the policy only when that differs from the
+/// helper's, as after an extension restart. A peer that refuses the helper
+/// (an extension too old to know it) is retried with a growing delay, so it
+/// does not log a refusal every few seconds.
 ///
 /// Only active while `isEnabled` says so: without a helper-driven feature
-/// turned on, nothing changes from how FreeSnitch delivered policy before.
+/// turned on, the helper never connects to the extension.
 final class ExtensionPolicyPusher: @unchecked Sendable {
-    /// Re-sent this often while enabled, so an extension that restarted (and
-    /// came back with no live policy) has the current one within this time.
-    static let resendInterval: TimeInterval = 15
+    static let checkInterval: TimeInterval = 15
+    static let maximumBackoff: TimeInterval = 600
+
+    typealias PolicyIdentity = (epoch: UInt64, generation: UInt64)
 
     private let queue = DispatchQueue(label: "io.isaaclins.freesnitch.extension-push", qos: .userInitiated)
     private let snapshot: () throws -> Data
+    private let current: () -> PolicyIdentity?
     private let isEnabled: () -> Bool
     private var connection: NSXPCConnection?
     private var timer: DispatchSourceTimer?
     private var lastProblem: String?
+    private var failures = 0
+    private var notBefore = Date.distantPast
 
     /// `snapshot` returns the encoded authoritative snapshot, or throws when
-    /// the policy cannot be read in full (nothing is sent then).
-    init(snapshot: @escaping () throws -> Data, isEnabled: @escaping () -> Bool) {
+    /// the policy cannot be read in full (nothing is sent then). `current`
+    /// names the policy that snapshot would carry, without building it.
+    init(snapshot: @escaping () throws -> Data,
+         current: @escaping () -> PolicyIdentity?,
+         isEnabled: @escaping () -> Bool) {
         self.snapshot = snapshot
+        self.current = current
         self.isEnabled = isEnabled
     }
 
     func start() {
         queue.async { [self] in
             let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: .now() + 2, repeating: Self.resendInterval, leeway: .seconds(2))
-            timer.setEventHandler { [weak self] in self?.pushLocked() }
+            timer.schedule(deadline: .now() + 2, repeating: Self.checkInterval, leeway: .seconds(2))
+            timer.setEventHandler { [weak self] in self?.checkLocked() }
             timer.resume()
             self.timer = timer
         }
     }
 
-    /// Sends the current policy now, if enabled.
+    /// Sends the current policy now, if enabled. Called on every change.
     func push() {
-        queue.async { [weak self] in self?.pushLocked() }
+        queue.async { [weak self] in
+            guard let self, self.enabledLocked(), Date() >= self.notBefore else { return }
+            self.sendLocked()
+        }
     }
 
-    private func pushLocked() {
+    private func enabledLocked() -> Bool {
         guard isEnabled() else {
             connection?.invalidate()
             connection = nil
-            return
+            return false
         }
+        return true
+    }
+
+    /// Asks which policy the extension holds and sends ours only if it
+    /// differs.
+    private func checkLocked() {
+        guard enabledLocked(), Date() >= notBefore else { return }
+        guard let proxy = proxyLocked() else { return }
+        proxy.register { [weak self] _, response in
+            let status = try? SharedRuleBridge.decodeStatus(response)
+            self?.queue.async {
+                guard let self else { return }
+                self.noteSuccessLocked()
+                guard let ours = self.current() else { return }
+                if let status, status.isReady, status.epoch == ours.epoch, status.generation == ours.generation { return }
+                self.sendLocked()
+            }
+        }
+    }
+
+    private func sendLocked() {
         let data: Data
         do { data = try snapshot() } catch {
             note("the policy could not be read, so none was sent: \(error.localizedDescription)")
             return
         }
-        let conn = connection ?? makeConnection()
-        guard let proxy = conn.remoteObjectProxyWithErrorHandler({ [weak self] error in
-            // Usually: no extension running (filter off, or not installed).
-            self?.queue.async { self?.dropConnection(conn, "not reachable: \(error.localizedDescription)") }
-        }) as? ProviderCommunication else {
-            note("the XPC proxy could not be created")
-            return
-        }
+        guard let proxy = proxyLocked() else { return }
         proxy.updateSnapshot(snapshotJSON: data) { [weak self] response in
             let status = try? SharedRuleBridge.decodeStatus(response)
             self?.queue.async {
+                guard let self else { return }
+                self.noteSuccessLocked()
                 if let status, status.isReady {
-                    self?.clearProblem()
+                    self.clearProblem()
+                } else if status?.rejection == .olderGeneration {
+                    // The app delivered a newer policy meanwhile; the next
+                    // check compares again.
+                    return
                 } else {
-                    self?.note("the extension did not accept the policy: \(status?.message ?? "unreadable acknowledgement")")
+                    self.note("the extension did not accept the policy: \(status?.message ?? "unreadable acknowledgement")")
                 }
             }
         }
+    }
+
+    private func proxyLocked() -> ProviderCommunication? {
+        let conn = connection ?? makeConnection()
+        guard let proxy = conn.remoteObjectProxyWithErrorHandler({ [weak self] error in
+            // Usually: no extension running (filter off, not installed), or
+            // an extension that does not accept the helper yet.
+            self?.queue.async { self?.failedLocked(conn, "not reachable: \(error.localizedDescription)") }
+        }) as? ProviderCommunication else {
+            note("the XPC proxy could not be created")
+            return nil
+        }
+        return proxy
     }
 
     private func makeConnection() -> NSXPCConnection {
@@ -80,14 +130,14 @@ final class ExtensionPolicyPusher: @unchecked Sendable {
         conn.exportedObject = HelperAppCommunication()
         conn.remoteObjectInterface = NSXPCInterface(with: ProviderCommunication.self)
         conn.invalidationHandler = { [weak self, weak conn] in
-            self?.queue.async { self?.dropConnection(conn, nil) }
+            self?.queue.async { self?.dropConnection(conn) }
         }
         conn.interruptionHandler = { [weak self, weak conn] in
-            // The extension process went away. Its replacement starts with no
-            // live policy, so it gets one as soon as it answers.
+            // The extension process went away. Its replacement starts without
+            // a live policy; check it as soon as it can answer.
             self?.queue.asyncAfter(deadline: .now() + 1) {
-                self?.dropConnection(conn, nil)
-                self?.pushLocked()
+                self?.dropConnection(conn)
+                self?.checkLocked()
             }
         }
         conn.resume()
@@ -95,18 +145,31 @@ final class ExtensionPolicyPusher: @unchecked Sendable {
         return conn
     }
 
-    private func dropConnection(_ conn: NSXPCConnection?, _ problem: String?) {
+    private func dropConnection(_ conn: NSXPCConnection?) {
         if let conn, conn === connection {
             connection = nil
             conn.invalidate()
         }
-        if let problem { note(problem) }
     }
 
-    /// Logged once per distinct problem, not on every resend.
+    private func failedLocked(_ conn: NSXPCConnection, _ problem: String) {
+        dropConnection(conn)
+        failures += 1
+        let delay = min(Self.maximumBackoff, Self.checkInterval * pow(2, Double(min(failures - 1, 10))))
+        notBefore = Date().addingTimeInterval(delay)
+        note(problem + " (next attempt in \(Int(delay)) s)")
+    }
+
+    private func noteSuccessLocked() {
+        failures = 0
+        notBefore = .distantPast
+    }
+
+    /// Logged once per distinct problem, not on every attempt.
     private func note(_ problem: String) {
-        guard problem != lastProblem else { return }
-        lastProblem = problem
+        let key = problem.components(separatedBy: " (next attempt").first ?? problem
+        guard key != lastProblem else { return }
+        lastProblem = key
         PSLog.info(PSLog.helper, "Policy delivery to the network extension: \(problem)")
     }
 

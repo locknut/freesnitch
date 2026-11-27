@@ -41,46 +41,33 @@ public struct TunnelTrigger: Codable, Equatable, Hashable, Sendable, Identifiabl
             .min { ($0.rank, $0.service ?? "", $0.profile) < ($1.rank, $1.service ?? "", $1.profile) }
     }
 
-    /// Stored as one JSON array in the helper's settings table.
-    public static let settingKey = "tunnel_triggers"
-}
+    public static let maximumCount = 32
+    public static let maximumServiceIDBytes = 255
 
-extension RuleStore {
-    /// The stored triggers, or none. A stored value that cannot be decoded
-    /// throws: it is not the same as "no triggers".
-    public func tunnelTriggers() throws -> [TunnelTrigger] {
-        guard let raw = getSetting(TunnelTrigger.settingKey) else { return [] }
-        do {
-            return try JSONDecoder().decode([TunnelTrigger].self, from: Data(raw.utf8))
-        } catch {
-            throw ProfileValidationError.invalidTunnelTrigger("the stored triggers could not be read: \(error.localizedDescription)")
-        }
-    }
-
-    /// Adds a trigger, replacing the one with the same condition (a condition
-    /// selects one profile). The profile must exist and must not be Always.
-    public func setTunnelTrigger(_ trigger: TunnelTrigger) throws -> [TunnelTrigger] {
+    /// Refuses a trigger that names something no dynamic store service id
+    /// can be, so the stored list stays small and printable.
+    public static func validate(_ trigger: TunnelTrigger) throws {
         guard trigger.profile != Profile.alwaysName else {
             throw ProfileValidationError.invalidTunnelTrigger("Always applies in every profile and cannot be activated")
         }
-        guard profile(named: trigger.profile) != nil else {
-            throw ProfileValidationError.invalidTunnelTrigger("there is no profile named \(trigger.profile)")
+        if let service = trigger.service {
+            guard service != TunnelStatus.unlistedTunnelID,
+                  service.utf8.count <= maximumServiceIDBytes,
+                  !service.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+                throw ProfileValidationError.invalidTunnelTrigger("\(service.prefix(64)) is not a VPN service id")
+            }
         }
-        var triggers = try tunnelTriggers().filter { $0.id != trigger.id }
-        triggers.append(trigger)
-        try saveTunnelTriggers(triggers)
-        return triggers
     }
 
-    public func removeTunnelTrigger(id: String) throws -> [TunnelTrigger] {
-        let triggers = try tunnelTriggers().filter { $0.id != id }
-        try saveTunnelTriggers(triggers)
-        return triggers
-    }
+    enum CodingKeys: String, CodingKey { case service, whenConnected, profile }
 
-    func saveTunnelTriggers(_ triggers: [TunnelTrigger]) throws {
-        let sorted = triggers.sorted { $0.id < $1.id }
-        try setSetting(TunnelTrigger.settingKey, String(decoding: try JSONEncoder().encode(sorted), as: UTF8.self))
+    /// Decoded through the same normalisation as `init`, so an empty service
+    /// from an older or hand-written payload means any VPN.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(service: try c.decodeIfPresent(String.self, forKey: .service),
+                  whenConnected: try c.decode(Bool.self, forKey: .whenConnected),
+                  profile: try c.decode(String.self, forKey: .profile))
     }
 }
 

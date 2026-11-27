@@ -27,14 +27,7 @@ public enum XPCPeerValidator {
     /// `permittedPeerIdentifiers`, which the helper's own listener also uses.
     public static func isTrustedHelper(_ connection: NSXPCConnection) -> Bool {
         trustedPeer(connection, requirement: requirement(for: [AppConstants.bundleIdHelper]))
-            && isHelper(connection)
-    }
-
-    /// True when the peer's signed identifier is the helper's. Ad-hoc builds
-    /// carry their target identifier too, so this holds for them as well.
-    public static func isHelper(_ connection: NSXPCConnection) -> Bool {
-        let id = identifier(of: connection)
-        return id == AppConstants.bundleIdHelper || id == "FreeSnitchHelper"
+            && identifier(of: connection) == AppConstants.bundleIdHelper
     }
 
     /// Used by the extension to keep a CLI inspection connection from taking

@@ -99,20 +99,83 @@ try coordinator.removeTunnelTrigger(id: "*|up")
 try coordinator.removeTunnelTrigger(id: "*|down")
 check("with no trigger matching, the gateway binding decides again", store.activeProfileName() == "Office")
 
-// 6. A deleted profile: the switch fails, is owed, and works once it exists.
-try coordinator.setTunnelTrigger(TunnelTrigger(service: nil, whenConnected: false, profile: "Restricted"))
+// 6. A switch that fails is owed and retried. Here a (managed) trigger
+//    names a profile that does not exist yet.
+coordinator.tunnelTriggers = { [TunnelTrigger(service: nil, whenConnected: false, profile: "Ghost")] }
 _ = try coordinator.activate(profileName: "Work", reason: .user)
-_ = try store.deleteProfile(name: "Restricted")
-check("a switch to a deleted profile reports failure", coordinator.applyObservedTunnelState([]) == false)
-check("and is owed", coordinator.pendingTunnelSwitch?.profile == "Restricted")
+check("a switch to a missing profile reports failure", coordinator.applyObservedTunnelState([]) == false)
+check("and is owed", coordinator.pendingTunnelSwitch?.profile == "Ghost" && coordinator.tunnelRetryOwed)
 check("the active profile stays", store.activeProfileName() == "Work")
-_ = try store.createProfile(name: "Restricted", mode: .silentDeny)
-check("a retry works once it exists", coordinator.applyObservedTunnelState([]) && store.activeProfileName() == "Restricted")
-check("nothing is owed any more", coordinator.pendingTunnelSwitch == nil)
+// 6b. While that trigger matches but has not switched, a gateway change is
+//     set aside, and applied once the trigger stops matching.
+check("a gateway delivered meanwhile is set aside", coordinator.applyObservedGatewayMAC("aa:bb:cc:dd:ee:09")
+      && coordinator.applyObservedGatewayMAC(officeMAC) && store.activeProfileName() == "Work")
+check("when the unsettled trigger stops matching, the gateway decides after all",
+      coordinator.applyObservedTunnelState([travel]) && store.activeProfileName() == "Office")
+_ = try store.createProfile(name: "Ghost", mode: .silentDeny)
+check("once the profile exists the trigger works", coordinator.applyObservedTunnelState([]) && store.activeProfileName() == "Ghost")
+check("nothing is owed any more", coordinator.pendingTunnelSwitch == nil && !coordinator.tunnelRetryOwed)
+coordinator.tunnelTriggers = { try store.tunnelTriggers() }
+
+// 6c. Handing back to the gateway is retried when it fails, like any
+//     gateway switch. The network switch is made to fail once by renaming
+//     the bound profile just before it is applied.
+for t in try store.tunnelTriggers() { try coordinator.removeTunnelTrigger(id: t.id) }
+try coordinator.setTunnelTrigger(TunnelTrigger(service: nil, whenConnected: true, profile: "Work"))
+check("set up: VPN up selects Work", coordinator.applyObservedTunnelState([travel]) && store.activeProfileName() == "Work")
+var renamedOnce = false
+coordinator.networkSwitchHookForTesting = {
+    guard !renamedOnce, let officeProfile = store.profile(named: "Office") else { return }
+    renamedOnce = true
+    var renamed = officeProfile; renamed.name = "Office 2"
+    _ = try? store.updateProfile(renamed)
+}
+check("a hand-back that fails reports failure", coordinator.applyObservedTunnelState([]) == false && coordinator.tunnelRetryOwed)
+check("and the profile has not moved yet", store.activeProfileName() == "Work")
+check("the retry hands back", coordinator.applyObservedTunnelState([]) && store.activeProfileName() == "Office 2" && !coordinator.tunnelRetryOwed)
+coordinator.networkSwitchHookForTesting = nil
+var back = store.profile(named: "Office 2")!; back.name = "Office"; _ = try store.updateProfile(back)
+
+// 6d. A manual pick holds when the trigger stops matching; only a new
+//     gateway or another winning trigger replaces it.
+check("VPN up again selects Work", coordinator.applyObservedTunnelState([travel]) && store.activeProfileName() == "Work")
+_ = try coordinator.activate(profileName: "Restricted", reason: .user)
+check("the VPN dropping keeps the user's pick", coordinator.applyObservedTunnelState([]) && store.activeProfileName() == "Restricted")
+check("a new gateway decides again", coordinator.applyObservedGatewayMAC("aa:bb:cc:dd:ee:0a")
+      && coordinator.applyObservedGatewayMAC(officeMAC) && store.activeProfileName() == "Office")
+_ = try coordinator.activate(profileName: "Restricted", reason: .user)
+try coordinator.setTunnelTrigger(TunnelTrigger(service: office, whenConnected: false, profile: "Ghost"))
+check("editing an unrelated trigger does not undo the user's pick", store.activeProfileName() == "Ghost" || store.activeProfileName() == "Restricted")
+
+// 6e. Triggers follow their profile: renamed with it, deleted with it.
+for t in try store.tunnelTriggers() { try coordinator.removeTunnelTrigger(id: t.id) }
+_ = try store.setTunnelTrigger(TunnelTrigger(service: office, whenConnected: true, profile: "Work"))
+var work = store.profile(named: "Work")!; work.name = "Corp VPN"; _ = try store.updateProfile(work)
+check("renaming a profile carries its trigger", (try? store.tunnelTriggers()) == [TunnelTrigger(service: office, whenConnected: true, profile: "Corp VPN")])
+_ = try store.deleteProfile(name: "Corp VPN")
+check("deleting a profile deletes its trigger", (try? store.tunnelTriggers()) == [])
+_ = try store.createProfile(name: "Corp VPN", mode: .alert)
+check("a new profile with the old name inherits nothing", (try? store.tunnelTriggers()) == [])
+_ = try store.createProfile(name: "Work", mode: .silentAllow)
+
+// 6f. Bounds.
+func refused(_ t: TunnelTrigger) -> Bool { (try? store.setTunnelTrigger(t)) == nil }
+check("an over-long service id is refused", refused(TunnelTrigger(service: String(repeating: "x", count: 300), whenConnected: true, profile: "Work")))
+check("the unlisted-tunnel marker is not a service", refused(TunnelTrigger(service: TunnelStatus.unlistedTunnelID, whenConnected: true, profile: "Work")))
+check("a control character is refused", refused(TunnelTrigger(service: "a\nb", whenConnected: true, profile: "Work")))
+for i in 0..<TunnelTrigger.maximumCount { _ = try? store.setTunnelTrigger(TunnelTrigger(service: "S\(i)", whenConnected: true, profile: "Work")) }
+check("the number of triggers is bounded", refused(TunnelTrigger(service: "one-too-many", whenConnected: true, profile: "Work")))
+check("but replacing an existing condition still works", !refused(TunnelTrigger(service: "S0", whenConnected: true, profile: "Ghost")))
+for t in try store.tunnelTriggers() { _ = try store.removeTunnelTrigger(id: t.id) }
+let decoded = try JSONDecoder().decode(TunnelTrigger.self, from: Data(#"{"service":"","whenConnected":true,"profile":"Work"}"#.utf8))
+check("a decoded empty service means any VPN", decoded.service == nil)
+check("an unlisted tunnel counts for any VPN, never for a named one",
+      anyUp.matches([TunnelStatus.unlistedTunnelID]) && !officeUp.matches([TunnelStatus.unlistedTunnelID]))
 
 // 7. An unreadable trigger list never blocks gateway bindings.
 coordinator.tunnelTriggers = { throw ProfileValidationError.invalidTunnelTrigger("test") }
-check("an unreadable list changes nothing on a VPN change", coordinator.applyObservedTunnelState([office]) && store.activeProfileName() == "Restricted")
+let beforeUnreadable = store.activeProfileName()
+check("an unreadable list changes nothing on a VPN change", coordinator.applyObservedTunnelState([office]) && store.activeProfileName() == beforeUnreadable)
 check("and the gateway binding decides", coordinator.applyObservedGatewayMAC("aa:bb:cc:dd:ee:03") && coordinator.applyObservedGatewayMAC(officeMAC)
       && store.activeProfileName() == "Office")
 
@@ -128,9 +191,11 @@ let absent = TunnelTrigger(service: "CloudflareWARP", whenConnected: false, prof
 check("a named VPN that is absent matches its not-connected trigger", absent.matches([]) && absent.matches([office]))
 check("and wins over any-VPN-not-connected", TunnelTrigger.winner([anyDown, absent], connected: []) == absent)
 coordinator.triggerEditRefusal = nil
-try coordinator.setTunnelTrigger(absent)
 _ = try coordinator.activate(profileName: "Office", reason: .user)
-check("with its service gone, the trigger switches", coordinator.applyObservedTunnelState([travel]) && store.activeProfileName() == "Restricted")
+check("set up: no trigger, the user's pick", coordinator.applyObservedTunnelState([travel]) && store.activeProfileName() == "Office")
+try coordinator.setTunnelTrigger(absent)
+check("with its service gone, the trigger switches", store.activeProfileName() == "Restricted")
+for t in try store.tunnelTriggers() { _ = try store.removeTunnelTrigger(id: t.id) }
 
 // 10. Remembering the VPN services seen.
 let t0 = Date(timeIntervalSince1970: 1_800_000_000)

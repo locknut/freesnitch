@@ -189,9 +189,6 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// Set only while `snapshotOrigin == .boot`; a live resend is checked
     /// against it, not against the copy this extension relaxed (#455).
     private var savedBootPolicy: SharedRuleBridge.Snapshot?
-    /// Whether the live policy in force was handed over by the helper itself
-    /// rather than relayed by the app. Guarded by `snapshotLock`.
-    private var liveSnapshotFromHelper = false
     /// The opt-in fail-closed recovery policy (Silent Deny plus the recovery
     /// rules) and its prepared order, used while no policy is in force. Nil
     /// when fail-closed is off: no policy then means allow, as it always has.
@@ -272,6 +269,18 @@ final class FilterDataProvider: NEFilterDataProvider {
                 return .unavailable("Network extension stopped before receiving the rule snapshot.")
             }
             return self.receiveSnapshot(data, from: source)
+        }
+        // The helper checks in between policy changes instead of resending
+        // its policy; it resends only when the policy here differs. A check-in
+        // from it therefore confirms the policy in force (MaximumPolicyAge).
+        IPCConnection.shared.onCheckIn = { [weak self] source in
+            guard let self, source == .helper else { return }
+            self.snapshotLock.lock()
+            if self.snapshotOrigin == .live {
+                self.lastPolicyDeliveryNanos = DispatchTime.now().uptimeNanoseconds
+                self.staleLogged = false
+            }
+            self.snapshotLock.unlock()
         }
         IPCConnection.shared.snapshotStatus = { [weak self] in
             self?.readSnapshotStatus()
@@ -1106,26 +1115,12 @@ final class FilterDataProvider: NEFilterDataProvider {
                     epoch: current.epoch,
                     rejection: .olderSession
                 )
-                snapshotStatus = status
+                if source == .app { snapshotStatus = status }
                 snapshotLock.unlock()
                 PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an older helper session's snapshot.")
                 return status
             }
             if let current, received.generation < current.generation {
-                // The helper delivers its policy directly too. An app relay
-                // that read the helper just before a change can arrive after
-                // the helper's own newer delivery: it is still not applied,
-                // but it is not a refusal either, because the policy in force
-                // is newer and from the same owner. Reporting it as refused
-                // would have the app restart the filter for nothing.
-                if case .sameSession? = authority, source == .app, snapshotOrigin == .live, liveSnapshotFromHelper {
-                    let status = SharedRuleBridge.SnapshotStatus.ready(for: current)
-                    snapshotStatus = status
-                    snapshotLock.unlock()
-                    PSLog.info(PSLog.netext,
-                               "kept generation \(current.generation) from the helper over the app's older relay of generation \(received.generation)")
-                    return status
-                }
                 // Only inside one helper session is a lower generation a
                 // rollback. Across sessions it is the owner restarting, and
                 // the epoch above has already ranked it.
@@ -1136,7 +1131,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                         epoch: current.epoch,
                         rejection: .olderGeneration
                     )
-                    snapshotStatus = status
+                    if source == .app { snapshotStatus = status }
                     snapshotLock.unlock()
                     PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an older live rule snapshot.")
                     return status
@@ -1154,7 +1149,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                     epoch: current.epoch,
                     rejection: .conflictingContent
                 )
-                snapshotStatus = status
+                if source == .app { snapshotStatus = status }
                 snapshotLock.unlock()
                 PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an invalid split-brain snapshot.")
                 return status
@@ -1172,9 +1167,8 @@ final class FilterDataProvider: NEFilterDataProvider {
                 let status = SharedRuleBridge.SnapshotStatus.ready(for: accepted)
                 setSnapshotLocked(accepted)
                 snapshotOrigin = .live
-                // An idempotent resend changes nothing about who delivered it,
-                // but it does show the sender is alive (MaximumPolicyAge).
-                if decision == .accepted { liveSnapshotFromHelper = source == .helper }
+                // An accepted or idempotent delivery shows the sender is alive
+                // (MaximumPolicyAge).
                 lastPolicyDeliveryNanos = DispatchTime.now().uptimeNanoseconds
                 staleLogged = false
                 savedBootPolicy = nil
@@ -1182,7 +1176,12 @@ final class FilterDataProvider: NEFilterDataProvider {
                 // Queued (not written) while the lock is held, so records land
                 // in the order the policies were accepted. The write itself
                 // runs on its own queue and never delays this reply.
-                if decision == .accepted { recordLiveWatermark(accepted) }
+                // Only the app saves the boot policy, so only what the app
+                // delivered may move the watermark the next start compares
+                // the saved policy against. A helper delivery the app never
+                // saved must not make that saved policy look superseded,
+                // which would make the next start fail open.
+                if decision == .accepted, source == .app { recordLiveWatermark(accepted) }
                 snapshotLock.unlock()
 
                 let allowCount = accepted.rules.filter { $0.action == .allow }.count
@@ -1203,7 +1202,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                     epoch: current?.epoch,
                     rejection: .olderGeneration
                 )
-                snapshotStatus = status
+                if source == .app { snapshotStatus = status }
                 snapshotLock.unlock()
                 PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an invalid live snapshot.")
                 return status
@@ -1215,7 +1214,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                     epoch: currentEpoch,
                     rejection: .olderSession
                 )
-                snapshotStatus = status
+                if source == .app { snapshotStatus = status }
                 snapshotLock.unlock()
                 PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an older helper session's snapshot.")
                 return status
@@ -1225,7 +1224,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                 "Network extension received an invalid rule snapshot: \(error.localizedDescription)"
             )
             snapshotLock.lock()
-            snapshotStatus = status
+            if source == .app { snapshotStatus = status }
             snapshotLock.unlock()
             PSLog.error(PSLog.netext, status.message ?? "Network extension received an invalid rule snapshot.")
             return status

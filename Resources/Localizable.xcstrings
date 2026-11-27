@@ -24,16 +24,6 @@
         }
       }
     },
-    "%@ (not connected)" : {
-      "localizations" : {
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@ (не подключён)"
-          }
-        }
-      }
-    },
     "%@ A disabled rule for this row exists; pressing this enables it." : {
       "localizations" : {
         "ru" : {
@@ -100,6 +90,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ FreeSnitch спросит снова при следующем запуске."
+          }
+        }
+      }
+    },
+    "%@ is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ подключён"
+          }
+        }
+      }
+    },
+    "%@ is connected (not connected now)" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ подключён (сейчас не подключён)"
+          }
+        }
+      }
+    },
+    "%@ is not connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ не подключён"
+          }
+        }
+      }
+    },
+    "%@ is not connected (connected now)" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ не подключён (сейчас подключён)"
           }
         }
       }
@@ -2535,6 +2565,16 @@
         }
       }
     },
+    "a tunnel no VPN service names" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "туннель без службы VPN"
+          }
+        }
+      }
+    },
     "A VPN" : {
       "localizations" : {
         "ru" : {
@@ -2635,12 +2675,12 @@
         }
       }
     },
-    "Activate when" : {
+    "Activate this profile when" : {
       "localizations" : {
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Включать, когда"
+            "value" : "Включать этот профиль, когда"
           }
         }
       }
@@ -2655,22 +2695,12 @@
         }
       }
     },
-    "any VPN" : {
+    "Any VPN is connected" : {
       "localizations" : {
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "любой VPN"
-          }
-        }
-      }
-    },
-    "Any VPN" : {
-      "localizations" : {
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Любой VPN"
+            "value" : "Подключён любой VPN"
           }
         }
       }
@@ -5065,6 +5095,16 @@
         }
       }
     },
+    "Could not switch to %@ for a VPN condition. FreeSnitch keeps trying." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось переключиться на %@ по условию VPN. FreeSnitch продолжает попытки."
+          }
+        }
+      }
+    },
     "Covers the app and the helpers inside it. Web pages shown in Apple's web views, as in Safari or Mail, load through a macOS process outside the app." : {
       "localizations" : {
         "ru" : {
@@ -7044,16 +7084,6 @@
         }
       }
     },
-    "is" : {
-      "localizations" : {
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "—"
-          }
-        }
-      }
-    },
     "It is approved but not responding. FreeSnitch is restarting it. If macOS asks, authorize the restart. The enabled service is never unregistered and your approval stays intact." : {
       "localizations" : {
         "ru" : {
@@ -7214,6 +7244,16 @@
         }
       }
     },
+    "No VPN is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ни один VPN не подключён"
+          }
+        }
+      }
+    },
     "not connected" : {
       "localizations" : {
         "ru" : {
@@ -7234,22 +7274,12 @@
         }
       }
     },
-    "State" : {
+    "Switch to %@ whenever this is true. A VPN counts as connected while it carries this Mac's default traffic; a split-tunnel VPN never does. While a VPN condition holds, it decides the profile instead of the network." : {
       "localizations" : {
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Состояние"
-          }
-        }
-      }
-    },
-    "Switch to %@ whenever this is true. A VPN counts as connected while it carries this Mac's default traffic." : {
-      "localizations" : {
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Переключаться на %@, когда это условие выполняется. VPN считается подключённым, пока через него идёт основной трафик этого Mac."
+            "value" : "Переключаться на %@, когда это условие выполняется. VPN считается подключённым, пока через него идёт основной трафик этого Mac; VPN с раздельным туннелированием — никогда. Пока условие VPN выполняется, профиль определяет оно, а не сеть."
           }
         }
       }
@@ -14145,6 +14175,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Когда %@ не подключён"
+          }
+        }
+      }
+    },
+    "When any VPN is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Когда подключён любой VPN"
+          }
+        }
+      }
+    },
+    "When no VPN is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Когда ни один VPN не подключён"
           }
         }
       }

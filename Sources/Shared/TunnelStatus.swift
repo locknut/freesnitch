@@ -5,19 +5,26 @@ import Foundation
 /// can report "connected" in a mode that opens no tunnel at all.
 ///
 /// A tunnel service is a network service in the dynamic store whose address
-/// entry names a tunnel interface (`utun*`, `ipsec*`, `ppp*`), or that has a
-/// `VPN` entry. Services are identified by their service id, never by the
-/// interface number, which changes from one connection to the next.
+/// entry names a tunnel interface (`utun*`, `ipsec*`, `ppp*`) with a routable
+/// address, or that has a `VPN` entry. Services are identified by their
+/// service id, never by the interface number, which changes from one
+/// connection to the next.
 ///
 /// A service counts as connected when it "owns the default route":
 ///  1. its address entry names an interface,
 ///  2. that interface exists, is up, and has a routable address,
-///  3. the kernel's route lookup for a public probe address (IPv4, and IPv6
-///     when the Mac has an IPv6 route at all) leaves through that interface.
+///  3. the kernel routes every IPv4 probe address through that interface,
+///     and every IPv6 probe address that has a route at all.
 ///
-/// A split-tunnel VPN, which routes only some networks, never owns the
-/// default route and so never counts as connected here. That is deliberate:
-/// these triggers are about whether general traffic goes through a tunnel.
+/// Several unrelated probe addresses are used, so a split-tunnel VPN that
+/// happens to route one of them does not count. A split-tunnel VPN never
+/// owns the default route and never counts as connected: these triggers are
+/// about whether general traffic goes through a tunnel.
+///
+/// A tunnel interface that owns the default route but belongs to no service
+/// (a tunnel set up by a command-line tool) counts for "any VPN" only, as
+/// `unlistedTunnelID`. It still has to pass every condition above, so an
+/// idle or address-less tunnel interface never counts.
 ///
 /// The decision is pure (`TunnelStatus.evaluate`) over what was read
 /// (`TunnelEnvironment`); `TunnelSetDebouncer` decides when it takes effect.
@@ -42,10 +49,12 @@ public struct TunnelService: Equatable, Hashable, Sendable, Codable, Identifiabl
 public struct TunnelReading: Equatable, Sendable {
     /// Every tunnel service present, connected or not, sorted by id.
     public var services: [TunnelService]
-    /// The services that own the default route right now.
+    /// The services that own the default route right now, plus
+    /// `TunnelStatus.unlistedTunnelID` when a tunnel without a service does.
     public var connected: Set<String>
-    /// Set when something could not be read. Then `connected` is empty:
-    /// an unknown state is never mistaken for a working tunnel.
+    /// Set when something could not be read. The debouncer then keeps the
+    /// state it had for a short, bounded window, and after it treats the
+    /// state as unknown, which is "nothing connected".
     public var failure: String?
     /// Why each present service is not connected, for logs and status.
     public var reasons: [String: TunnelDownReason]
@@ -65,7 +74,7 @@ public enum TunnelDownReason: Equatable, Sendable, CustomStringConvertible {
     case interfaceMissing(String)
     case interfaceDown(String)
     case noAddress(String)
-    /// Traffic for the probe address leaves by another interface, or by none.
+    /// Traffic for a probe address leaves by another interface, or by none.
     case notDefaultRoute(family: TunnelAddressFamily, interface: String?)
 
     public var description: String {
@@ -104,40 +113,43 @@ public struct TunnelEnvironment {
     public var store: [String: Any]
     /// Interface name to its state. An interface missing here does not exist.
     public var interfaces: [String: TunnelInterfaceState]
-    /// The interface the kernel would send the IPv4 probe through, or nil
-    /// when there is no IPv4 route.
-    public var ipv4ProbeRoute: String?
-    /// The same for IPv6. Nil means no IPv6 route at all, which is fine:
+    /// The interface the kernel would send each IPv4 probe through, in the
+    /// order of `TunnelProbe.ipv4`; nil for a probe with no route.
+    public var ipv4ProbeRoutes: [String?]
+    /// The same for IPv6. All nil means no IPv6 route at all, which is fine:
     /// then nothing can go around a tunnel over IPv6.
-    public var ipv6ProbeRoute: String?
+    public var ipv6ProbeRoutes: [String?]
     /// Set when a read failed.
     public var readFailure: String?
 
     public init(store: [String: Any], interfaces: [String: TunnelInterfaceState],
-                ipv4ProbeRoute: String?, ipv6ProbeRoute: String?, readFailure: String? = nil) {
+                ipv4ProbeRoutes: [String?], ipv6ProbeRoutes: [String?], readFailure: String? = nil) {
         self.store = store
         self.interfaces = interfaces
-        self.ipv4ProbeRoute = ipv4ProbeRoute
-        self.ipv6ProbeRoute = ipv6ProbeRoute
+        self.ipv4ProbeRoutes = ipv4ProbeRoutes
+        self.ipv6ProbeRoutes = ipv6ProbeRoutes
         self.readFailure = readFailure
     }
 }
 
 /// The probe addresses whose routes decide which interface owns the default
-/// route. A route lookup sends nothing; the address only has to be public and
-/// outside any range a VPN deliberately excludes. Configurable for that case.
+/// route. A route lookup sends nothing; the addresses only have to be public,
+/// unrelated to each other, and outside any range a VPN deliberately
+/// excludes.
 public struct TunnelProbe: Equatable, Sendable {
-    public let ipv4: String
-    public let ipv6: String
+    public let ipv4: [String]
+    public let ipv6: [String]
 
-    public init(ipv4: String, ipv6: String) {
+    public init(ipv4: [String], ipv6: [String]) {
+        precondition(!ipv4.isEmpty, "at least one IPv4 probe is needed")
         self.ipv4 = ipv4
         self.ipv6 = ipv6
     }
 
-    /// Two well-known public anycast resolver addresses. Any public address
-    /// would do.
-    public static let standard = TunnelProbe(ipv4: "1.1.1.1", ipv6: "2606:4700:4700::1111")
+    /// Well-known public anycast resolver addresses in unrelated networks.
+    public static let standard = TunnelProbe(
+        ipv4: ["1.1.1.1", "8.8.8.8", "208.67.222.222"],
+        ipv6: ["2606:4700:4700::1111", "2001:4860:4860::8888"])
 }
 
 public enum TunnelStatus {
@@ -151,8 +163,13 @@ public enum TunnelStatus {
     ]
     public static let globalPatterns = ["State:/Network/Global/IPv4", "State:/Network/Global/IPv6"]
 
+    /// Stands for a tunnel interface that owns the default route but belongs
+    /// to no service. Not a valid dynamic store service id, so no service
+    /// can be confused with it; never listed, never chosen in a trigger.
+    public static let unlistedTunnelID = "<unlisted tunnel>"
+
     /// Interface name prefixes macOS uses for tunnels.
-    public static let tunnelInterfacePrefixes = ["utun", "ipsec", "ppp", "tun", "tap"]
+    public static let tunnelInterfacePrefixes = ["utun", "ipsec", "ppp"]
 
     /// The tunnel services in a store snapshot, each with the interface its
     /// address entry names, if any.
@@ -182,11 +199,12 @@ public enum TunnelStatus {
 
     public static func isTunnelInterface(_ name: String) -> Bool {
         tunnelInterfacePrefixes.contains { prefix in
-            name.hasPrefix(prefix) && name.dropFirst(prefix.count).allSatisfy(\.isNumber)
+            name.hasPrefix(prefix) && name.count > prefix.count && name.dropFirst(prefix.count).allSatisfy(\.isNumber)
         }
     }
 
-    /// Pure. A read failure leaves nothing connected.
+    /// Pure. A read failure is passed on with nothing connected; the
+    /// debouncer decides what that means.
     public static func evaluate(_ env: TunnelEnvironment) -> TunnelReading {
         let found = tunnelServices(in: env.store)
         let services = found.map(\.service)
@@ -203,6 +221,12 @@ public enum TunnelStatus {
                 connected.insert(service.id)
             }
         }
+        // A tunnel interface owning the default route that no service names.
+        let named = Set(found.compactMap(\.interface))
+        let unlisted = env.interfaces.keys.contains { name in
+            isTunnelInterface(name) && !named.contains(name) && downReason(interface: name, env: env) == nil
+        }
+        if unlisted { connected.insert(unlistedTunnelID) }
         return TunnelReading(services: services, connected: connected, reasons: reasons)
     }
 
@@ -210,24 +234,25 @@ public enum TunnelStatus {
         guard let state = env.interfaces[interface] else { return .interfaceMissing(interface) }
         guard state.isUp else { return .interfaceDown(interface) }
         guard state.addresses.contains(where: isRoutable) else { return .noAddress(interface) }
-        guard env.ipv4ProbeRoute == interface else {
-            return .notDefaultRoute(family: .ipv4, interface: env.ipv4ProbeRoute)
+        if env.ipv4ProbeRoutes.isEmpty { return .notDefaultRoute(family: .ipv4, interface: nil) }
+        if let elsewhere = env.ipv4ProbeRoutes.first(where: { $0 != interface }) {
+            return .notDefaultRoute(family: .ipv4, interface: elsewhere)
         }
-        if let v6 = env.ipv6ProbeRoute, v6 != interface {
-            return .notDefaultRoute(family: .ipv6, interface: v6)
+        if let elsewhere = env.ipv6ProbeRoutes.compactMap({ $0 }).first(where: { $0 != interface }) {
+            return .notDefaultRoute(family: .ipv6, interface: elsewhere)
         }
         return nil
     }
 
-    /// Not link-local and not loopback: an address the tunnel can carry
-    /// traffic from.
+    /// Not link-local, loopback or unspecified: an address the tunnel can
+    /// carry traffic from.
     public static func isRoutable(_ address: String) -> Bool {
         let bare = address.split(separator: "%", maxSplits: 1).first.map(String.init) ?? address
         guard let bytes = CIDR.bytes(bare) else { return false }
-        if bytes.count == 4 { return bytes[0] != 127 && !(bytes[0] == 169 && bytes[1] == 254) }
+        if bytes.count == 4 { return bytes[0] != 127 && bytes[0] != 0 && !(bytes[0] == 169 && bytes[1] == 254) }
         let linkLocal = bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80
-        let loopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1
-        return !linkLocal && !loopback
+        let loopbackOrUnspecified = bytes.dropLast().allSatisfy { $0 == 0 } && (bytes.last == 1 || bytes.last == 0)
+        return !linkLocal && !loopbackOrUnspecified
     }
 
     private static func serviceKey(_ key: String) -> (String, String)? {
@@ -246,35 +271,60 @@ public enum TunnelStatus {
 }
 
 /// The settled set of connected tunnel services, which other code acts on.
+///
 /// Asymmetric on purpose: a service that stops owning the default route
 /// leaves the set on the first reading that says so, because traffic is
 /// already going around it; a service joins only after it has owned the
-/// route for `upHold` across at least `upReadings` readings, because tunnels
-/// publish their interface and route shortly before they are usable, and
-/// flap while reconnecting. A failed read empties the set at once.
+/// route for `upHold` seconds across at least `upReadings` readings, because
+/// tunnels publish their interface and route shortly before they are usable,
+/// and flap while reconnecting.
+///
+/// A reading that failed keeps the set for at most `failureGrace` seconds
+/// (retried every `failureRetry`); past that the state is unknown, which is
+/// "nothing connected". A stuck "connected" is the worse failure for a
+/// profile that is meant to tighten when the tunnel goes.
+///
+/// Times are monotonic seconds (system uptime), never wall-clock dates.
 public struct TunnelSetDebouncer: Sendable {
     public let upHold: TimeInterval
     public let upReadings: Int
+    public let failureGrace: TimeInterval
+    public let failureRetry: TimeInterval
 
     public private(set) var connected: Set<String> = []
-    private var pending: [String: (since: Date, readings: Int)] = [:]
+    private var pending: [String: (since: TimeInterval, readings: Int)] = [:]
+    private var failingSince: TimeInterval?
+    private var lastFailureAt: TimeInterval?
 
-    public init(upHold: TimeInterval = 3, upReadings: Int = 2) {
-        precondition(upHold >= 0 && upReadings >= 1)
+    public init(upHold: TimeInterval = 3, upReadings: Int = 2,
+                failureGrace: TimeInterval = 2, failureRetry: TimeInterval = 0.5) {
+        precondition(upHold >= 0 && upReadings >= 1 && failureGrace >= 0 && failureRetry > 0)
         self.upHold = upHold
         self.upReadings = upReadings
+        self.failureGrace = failureGrace
+        self.failureRetry = failureRetry
     }
 
     /// Feeds one reading. Returns the new set when it changed.
-    public mutating func observe(_ reading: TunnelReading, at now: Date) -> Set<String>? {
-        let seen = reading.failure == nil ? reading.connected : []
+    public mutating func observe(_ reading: TunnelReading, at now: TimeInterval) -> Set<String>? {
         let before = connected
+        if reading.failure != nil {
+            let since = failingSince ?? now
+            failingSince = since
+            lastFailureAt = now
+            pending.removeAll()
+            if now - since >= failureGrace { connected = [] }
+            return connected == before ? nil : connected
+        }
+        failingSince = nil
+        lastFailureAt = nil
+        let seen = reading.connected
         connected.formIntersection(seen)
         pending = pending.filter { seen.contains($0.key) }
         for id in seen where !connected.contains(id) {
             var entry = pending[id] ?? (now, 0)
             entry.readings += 1
-            if entry.readings >= upReadings, now.timeIntervalSince(entry.since) >= upHold {
+            if entry.readings >= upReadings, now - entry.since >= upHold {
                 connected.insert(id)
                 pending[id] = nil
             } else {
@@ -284,37 +334,31 @@ public struct TunnelSetDebouncer: Sendable {
         return connected == before ? nil : connected
     }
 
-    /// When the next pending service could join, so a monitor can read once
-    /// more then instead of waiting for its slow poll.
-    public var nextDeadline: Date? {
-        pending.values.map { $0.since.addingTimeInterval(upHold) }.min()
+    /// When the next reading should be taken: a pending service's hold end,
+    /// or the retry of a failed read. Monotonic seconds.
+    public var nextDeadline: TimeInterval? {
+        var deadlines = pending.values.map { $0.since + upHold }
+        // Retried quickly only inside the grace; a read that keeps failing is
+        // left to the monitor's slow poll, so it is not retried in a loop.
+        if let lastFailureAt, let failingSince, lastFailureAt - failingSince < failureGrace {
+            deadlines.append(lastFailureAt + failureRetry)
+        }
+        return deadlines.min()
     }
 
-    /// True while a service that owns the route is still inside its hold.
-    public var hasPending: Bool { !pending.isEmpty }
+    /// True while a service is inside its hold or a failure inside its grace.
+    public var isUnsettled: Bool { !pending.isEmpty || failingSince != nil }
+
+    public mutating func reset() {
+        connected = []
+        pending.removeAll()
+        failingSince = nil
+        lastFailureAt = nil
+    }
 }
 
-/// CIDR membership for IPv4 and IPv6 literals, without sockets.
+/// Address literal parsing without sockets.
 public enum CIDR {
-    public static func contains(_ prefix: String, address: String) -> Bool {
-        let parts = prefix.split(separator: "/", maxSplits: 1)
-        guard parts.count == 2, let bits = Int(parts[1]),
-              let network = bytes(String(parts[0])), let host = bytes(stripZone(address)),
-              network.count == host.count, bits >= 0, bits <= network.count * 8 else { return false }
-        var remaining = bits
-        for index in 0..<network.count where remaining > 0 {
-            let take = min(8, remaining)
-            let mask: UInt8 = take == 8 ? 0xFF : ~(UInt8(0xFF) >> take)
-            if network[index] & mask != host[index] & mask { return false }
-            remaining -= take
-        }
-        return true
-    }
-
-    private static func stripZone(_ address: String) -> String {
-        address.split(separator: "%", maxSplits: 1).first.map(String.init) ?? address
-    }
-
     static func bytes(_ literal: String) -> [UInt8]? {
         var v4 = in_addr()
         if literal.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
