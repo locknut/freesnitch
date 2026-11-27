@@ -153,6 +153,35 @@ struct Verify {
         check("two connected VPNs are both listed", VPNStatus.connectedVPNs(in: both).count == 2)
         check("and counted in the rules line", VPNStatus.rulesSummary(VPNStatus.connectedVPNs(in: both))?.hasPrefix("2 VPNs are connected.") == true)
 
+        // 8. A client that manages its own service publishes no VPN entry
+        //    and no name (captured from a Mac running Cloudflare WARP): it is
+        //    still a connected VPN, named by its service id, and since it
+        //    takes every lookup the DNS line says so (#424).
+        var warp = base()
+        warp["State:/Network/Service/CloudflareWARP/IPv4"] = ["Addresses": ["100.96.0.7"], "InterfaceName": "utun0",
+                                                             "Router": "100.96.0.7", "ServerAddress": "127.0.0.1"]
+        warp["State:/Network/Service/CloudflareWARP/IPv6"] = ["Addresses": ["2606:4700:cf1:1000::3"], "InterfaceName": "utun0"]
+        warp["State:/Network/Service/CloudflareWARP/DNS"] = ["ServerAddresses": ["127.0.2.2", "127.0.2.3"]]
+        warp[VPNStatus.globalDNSKey] = ["ServerAddresses": ["127.0.2.2", "127.0.2.3"], "__CONFIGURATION_ID__": "Default: \(wifi) 0"]
+        let warpVPNs = VPNStatus.connectedVPNs(in: warp)
+        check("a VPN with no VPN entry is found by its tunnel interface", warpVPNs.count == 1 && warpVPNs.first?.interface == "utun0")
+        check("and named by its service id", warpVPNs.first?.displayName == "CloudflareWARP")
+        check("it takes every lookup, so the DNS line says so with the existing wording",
+              VPNStatus.dnsSummary(warpVPNs, routesThroughProxy: false)?
+                .hasPrefix("CloudflareWARP is handling DNS right now (127.0.2.2, 127.0.2.3), so FreeSnitch's DNS blocking") == true)
+        check("and nothing is said once lookups reach FreeSnitch (#437 unchanged)",
+              VPNStatus.dnsSummary(warpVPNs, routesThroughProxy: true) == nil)
+        var system = base()
+        system["State:/Network/Service/4DAA5319-454E-423E-92BE-08397A803896/IPv6"] =
+            ["Addresses": ["fe80::fa3c:ff39:8a64:888e%utun1"], "InterfaceName": "utun1", "Router": "fe80::"]
+        check("a link-local-only system tunnel is not a VPN", VPNStatus.connectedVPNs(in: system).isEmpty)
+        var plainInterface = base()
+        plainInterface["State:/Network/Service/ABCD/IPv4"] = ["Addresses": ["10.0.0.5"], "InterfaceName": "en5"]
+        check("a service on an ordinary interface is not a VPN", VPNStatus.connectedVPNs(in: plainInterface).isEmpty)
+        var disconnected = base()
+        disconnected["State:/Network/Service/CloudflareWARP/DNS"] = ["ServerAddresses": ["127.0.2.2"]]
+        check("a service with no address entry (disconnected) is not listed", VPNStatus.connectedVPNs(in: disconnected).isEmpty)
+
         if failures > 0 {
             print("vpn status harness: \(failures) FAILURES")
             exit(1)

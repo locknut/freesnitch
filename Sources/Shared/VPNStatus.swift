@@ -59,7 +59,11 @@ public enum VPNStatus {
     ///
     /// A service counts as a connected VPN when it has a `VPN` entry and an
     /// IPv4 or IPv6 entry naming its interface: macOS writes the address
-    /// entries only while the tunnel is up. The VPN takes all lookups when the
+    /// entries only while the tunnel is up. Some VPN clients (Network
+    /// Extension apps that manage their own service) publish no `VPN` entry;
+    /// a service whose address entry names a tunnel interface (`utun`,
+    /// `ipsec`, `ppp`) with a routable address counts too. Link-local-only
+    /// tunnels that macOS keeps for its own services do not. The VPN takes all lookups when the
     /// global DNS configuration came from it, or when its servers are the
     /// global servers.
     public static func connectedVPNs(in store: [String: Any]) -> [ActiveVPN] {
@@ -68,8 +72,14 @@ public enum VPNStatus {
         let globalSource = (globalDNS?["__CONFIGURATION_ID__"] as? String) ?? ""
 
         var result: [ActiveVPN] = []
-        for key in store.keys.sorted() {
-            guard let serviceID = serviceID(of: key, suffix: "/VPN") else { continue }
+        let serviceIDs = Set(store.keys.compactMap { serviceID(of: $0, suffix: "/VPN") })
+            .union(store.keys.compactMap { key in
+                for suffix in ["/IPv4", "/IPv6"] {
+                    if let id = serviceID(of: key, suffix: suffix), isTunnelAddressEntry(store[key]) { return id }
+                }
+                return nil
+            })
+        for serviceID in serviceIDs.sorted() {
             let base = "State:/Network/Service/\(serviceID)"
             let interface = interfaceName(store["\(base)/IPv4"]) ?? interfaceName(store["\(base)/IPv6"])
             guard let interface else { continue }
@@ -88,7 +98,10 @@ public enum VPNStatus {
             // resolver the user set anyway.
             let sameServers = (match.isEmpty || claimsDefault) && !servers.isEmpty && !globalServers.isEmpty
                 && globalServers.isSubset(of: Set(servers))
-            result.append(ActiveVPN(name: setup?["UserDefinedName"] as? String,
+            // A client that manages its own service often sets no name; its
+            // service id is chosen to be readable, so it names it.
+            let name = (setup?["UserDefinedName"] as? String) ?? (store["\(base)/VPN"] == nil ? serviceID : nil)
+            result.append(ActiveVPN(name: name,
                                     interface: interface,
                                     dnsServers: servers,
                                     matchDomains: match,
@@ -102,6 +115,31 @@ public enum VPNStatus {
         guard key.hasPrefix(prefix), key.hasSuffix(suffix) else { return nil }
         let id = key.dropFirst(prefix.count).dropLast(suffix.count)
         return id.isEmpty || id.contains("/") ? nil : String(id)
+    }
+
+    /// An address entry naming a tunnel interface with an address that is
+    /// not link-local, loopback or unspecified.
+    private static func isTunnelAddressEntry(_ value: Any?) -> Bool {
+        guard let name = interfaceName(value),
+              ["utun", "ipsec", "ppp"].contains(where: { prefix in
+                  name.hasPrefix(prefix) && name.count > prefix.count && name.dropFirst(prefix.count).allSatisfy(\.isNumber)
+              }),
+              let addresses = (value as? [String: Any])?["Addresses"] as? [String] else { return false }
+        return addresses.contains { address in
+            let bare = address.split(separator: "%", maxSplits: 1).first.map(String.init) ?? address
+            var v4 = in_addr()
+            if bare.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
+                let first = UInt32(bigEndian: v4.s_addr) >> 24
+                let second = (UInt32(bigEndian: v4.s_addr) >> 16) & 0xFF
+                return first != 0 && first != 127 && !(first == 169 && second == 254)
+            }
+            var v6 = in6_addr()
+            guard bare.withCString({ inet_pton(AF_INET6, $0, &v6) }) == 1 else { return false }
+            let bytes = withUnsafeBytes(of: &v6) { Array($0) }
+            let linkLocal = bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80
+            let loopbackOrUnspecified = bytes.dropLast().allSatisfy { $0 == 0 }
+            return !linkLocal && !loopbackOrUnspecified
+        }
     }
 
     private static func interfaceName(_ value: Any?) -> String? {
