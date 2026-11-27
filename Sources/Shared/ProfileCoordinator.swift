@@ -173,6 +173,9 @@ public final class ProfileCoordinator: @unchecked Sendable {
     public func activate(profileName: String, reason: SwitchReason = .user) throws -> SwitchResult {
         switchSerial.lock()
         defer { switchSerial.unlock() }
+        if reason == .user || reason == .undo, let refusal = userSwitchRefusal?() {
+            throw ProfileValidationError.managedByOrganization(refusal)
+        }
         let previousName = store.activeProfileName()
         let previousPolicy = try? store.profilePolicy(named: previousName)
         let activated = try store.setActiveProfile(name: profileName)
@@ -418,6 +421,11 @@ public final class ProfileCoordinator: @unchecked Sendable {
         defer { switchSerial.unlock() }
         return tunnelUp
     }
+
+    /// Consulted before a switch the user asked for (a pick or an undo).
+    /// Returns why it is refused, or nil to allow it. The helper sets it when
+    /// MDM locks the profile the tunnel switch chose.
+    public var userSwitchRefusal: (() -> String?)?
 
     /// Where saving the tunnel setting goes. The store by default; the helper
     /// replaces it to refuse a change to a value MDM has locked.

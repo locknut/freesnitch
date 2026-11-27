@@ -464,10 +464,13 @@ struct ProfilesSettingsView: View {
             Toggle("Use while Cloudflare WARP is connected", isOn: tunnelBinding(profile, connected: true, setting))
             Toggle("Use while Cloudflare WARP is not connected", isOn: tunnelBinding(profile, connected: false, setting))
             Text(tunnelStateLabel).font(.caption).foregroundStyle(.secondary)
+            if tunnelSwitchManaged {
+                Text("Managed by your organization.").font(.caption).foregroundStyle(.secondary)
+            }
         }
         .toggleStyle(.checkbox)
         .controlSize(.small)
-        .disabled(!profileClient.isAvailable || profileClient.snapshot?.tunnelProfileSwitch == nil)
+        .disabled(!profileClient.isAvailable || profileClient.snapshot?.tunnelProfileSwitch == nil || tunnelSwitchManaged)
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
     }
@@ -484,6 +487,8 @@ struct ProfilesSettingsView: View {
             }
         )
     }
+
+    private var tunnelSwitchManaged: Bool { profileClient.snapshot?.tunnelProfileSwitchManaged == true }
 
     private var tunnelStateLabel: String {
         switch profileClient.snapshot?.tunnelConnected {

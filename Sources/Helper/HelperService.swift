@@ -189,6 +189,15 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     /// Delivers policy to the network extension without the app, while a
     /// helper-driven feature needs it. Set once in `init`.
     private var extensionPusher: ExtensionPolicyPusher?
+    /// MDM-managed settings (`/Library/Managed Preferences`). `.none` until
+    /// the watcher has read them, and whenever no profile delivers any.
+    private let managedWatcher = ManagedPreferencesWatcher()
+    private let managedLock = NSLock()
+    private var managedStorage = ManagedPreferences.none
+    private var managed: ManagedPreferences {
+        managedLock.lock(); defer { managedLock.unlock() }
+        return managedStorage
+    }
     private let dns = DNSProxy()
     private let netmon = NetMonitor()
     private let recentNames = RecentHostNames()
@@ -412,13 +421,65 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
                 return try SharedRuleBridge.encode(try self.authoritativeSnapshot())
             },
             isEnabled: { [weak self] in self?.helperDeliversPolicy() ?? false })
+
+        // A managed tunnel switch replaces the stored one, and cannot be
+        // changed from the app while it is managed.
+        let storeRef = store
+        profileCoordinator.tunnelSwitchSettings = { [weak self] in
+            if let managed = self?.managed.tunnelProfileSwitch { return managed }
+            return try storeRef.tunnelProfileSwitch()
+        }
+        profileCoordinator.saveTunnelSwitchSettings = { [weak self] setting in
+            if self?.managed.tunnelProfileSwitch != nil {
+                throw ProfileValidationError.managedByOrganization("the tunnel profile switch is set by MDM")
+            }
+            try storeRef.setTunnelProfileSwitch(setting)
+        }
+        // With LockSettings, a profile the managed tunnel switch chose stays
+        // until the tunnel changes; the user cannot pick another.
+        profileCoordinator.userSwitchRefusal = { [weak self] in
+            guard let self else { return nil }
+            let managed = self.managed
+            guard managed.lockSettings, let tunnel = managed.tunnelProfileSwitch,
+                  let up = self.profileCoordinator.currentTunnelState,
+                  tunnel.target(tunnelUp: up) != nil else { return nil }
+            return "the profile follows Cloudflare WARP's state"
+        }
+        profiles.tunnelSwitchManaged = { [weak self] in self?.managed.tunnelProfileSwitch != nil }
+        managedWatcher.onChange = { [weak self] prefs in
+            self?.profileQueue.async { self?.applyManaged(prefs) }
+        }
+    }
+
+    /// Applies a new version of the managed preferences: profiles, bindings
+    /// and rules into the store, then the tunnel switch against the current
+    /// tunnel state, then the policy republished. Runs on `profileQueue`.
+    private func applyManaged(_ prefs: ManagedPreferences) {
+        managedLock.lock()
+        managedStorage = prefs
+        managedLock.unlock()
+        do {
+            let outcome = try ManagedPolicySync.apply(prefs, to: store)
+            for problem in outcome.problems {
+                PSLog.error(PSLog.helper, "Managed preferences: \(problem)")
+            }
+            if outcome.policyChanged || !outcome.createdProfiles.isEmpty {
+                PSLog.info(PSLog.helper, "Managed rules applied: \(outcome.addedRules) added or updated, "
+                           + "\(outcome.removedRules) removed; profiles created: \(outcome.createdProfiles)")
+                republishActivePolicy()
+            }
+        } catch {
+            PSLog.error(PSLog.helper, "Managed preferences could not be applied: \(error.localizedDescription)")
+        }
+        profileCoordinator.reapplyTunnelState()
+        extensionPusher?.push()
     }
 
     /// Whether the helper hands policy to the extension itself. Only while a
     /// feature that changes policy without the app is turned on, so nothing
     /// changes for anyone who uses neither.
     private func helperDeliversPolicy() -> Bool {
-        (try? profileCoordinator.tunnelSwitchSettings())?.isConfigured == true
+        managed.helperDeliversPolicy || (try? profileCoordinator.tunnelSwitchSettings())?.isConfigured == true
     }
 
     func start() {
@@ -436,6 +497,7 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
                        + (up ? "carrying this Mac's traffic" : "not carrying this Mac's traffic (\(reading))"))
             self.profileQueue.async { self.applyTunnelState(up) }
         }
+        managedWatcher.start()
         tunnelMonitor.start()
         extensionPusher?.start()
     }
@@ -1079,6 +1141,11 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
 
     func removeRule(idString: String, reply: @escaping (Bool, String?) -> Void) {
         guard let id = UUID(uuidString: idString) else { reply(false, "bad uuid"); return }
+        // MDM put it there and would put it back; say so instead.
+        if ManagedPolicySync.managedRuleIDs(in: store).contains(id) {
+            reply(false, ProfileValidationError.managedByOrganization("this rule is set by MDM").localizedDescription)
+            return
+        }
         do {
             _ = try mutatePolicy { draft in
                 draft.rules.removeAll { $0.id == id }

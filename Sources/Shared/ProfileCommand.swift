@@ -53,6 +53,8 @@ public struct ProfileSnapshot: Codable, Sendable {
     public var tunnelConnected: Bool?
     /// The profile the tunnel switch still owes, when activating it failed.
     public var pendingTunnelProfile: String?
+    /// True when MDM sets the tunnel switch, so the app shows it read-only.
+    public var tunnelProfileSwitchManaged: Bool?
 
     public init(profiles: [Profile],
                 activeProfile: String,
@@ -68,7 +70,8 @@ public struct ProfileSnapshot: Codable, Sendable {
                 gatewayReadProblem: ProfileProblem? = nil,
                 tunnelProfileSwitch: TunnelProfileSwitch? = nil,
                 tunnelConnected: Bool? = nil,
-                pendingTunnelProfile: String? = nil) {
+                pendingTunnelProfile: String? = nil,
+                tunnelProfileSwitchManaged: Bool? = nil) {
         self.profiles = profiles
         self.activeProfile = activeProfile
         self.alwaysRuleCount = alwaysRuleCount
@@ -84,6 +87,7 @@ public struct ProfileSnapshot: Codable, Sendable {
         self.tunnelProfileSwitch = tunnelProfileSwitch
         self.tunnelConnected = tunnelConnected
         self.pendingTunnelProfile = pendingTunnelProfile
+        self.tunnelProfileSwitchManaged = tunnelProfileSwitchManaged
     }
 
     /// True when the current network is already bound to the active profile,
@@ -168,6 +172,8 @@ public final class ProfileCommandService: @unchecked Sendable {
     /// authoritative snapshot. It affects new flows only; nothing here touches
     /// an established connection.
     public var onPolicyChanged: ((ProfilePolicy) -> Void)?
+    /// Whether MDM sets the tunnel switch; reported in every snapshot.
+    public var tunnelSwitchManaged: (() -> Bool)?
 
     public init(store: RuleStore, coordinator: ProfileCoordinator) {
         self.store = store
@@ -269,7 +275,8 @@ public final class ProfileCommandService: @unchecked Sendable {
             gatewayReadProblem: coordinator.gatewayReadProblem,
             tunnelProfileSwitch: try? coordinator.tunnelSwitchSettings(),
             tunnelConnected: coordinator.currentTunnelState,
-            pendingTunnelProfile: coordinator.pendingTunnelSwitch?.profile
+            pendingTunnelProfile: coordinator.pendingTunnelSwitch?.profile,
+            tunnelProfileSwitchManaged: tunnelSwitchManaged?() ?? false
         )
     }
 

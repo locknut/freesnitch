@@ -107,52 +107,11 @@ public struct FailClosedPolicy: Equatable, Sendable {
     }
 
     static func rule(from entry: [String: Any], index: Int) throws -> Rule {
-        func string(_ key: String) throws -> String? {
-            guard let value = entry[key] else { return nil }
-            guard let text = value as? String else {
-                throw ParseError.invalidEntry(index: index, reason: "\(key) is not text")
-            }
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+        do {
+            return try ConfigurationRuleEntry.rule(from: entry, action: .allow, priority: 900, groupName: groupName,
+                                                   notesPrefix: "Fail-closed recovery")
+        } catch let error as ConfigurationRuleEntry.EntryError {
+            throw ParseError.invalidEntry(index: index, reason: error.reason)
         }
-        let host = try string("Host")?.lowercased()
-        let bundleID = try string("BundleID")
-        let teamID = try string("TeamID")
-        let path = try string("Path")
-        let address = try string("Address")
-        if let address, let reason = RuleAddressValidator.rejectionReason(forRemoteIP: address) {
-            throw ParseError.invalidEntry(index: index, reason: "Address \(address): \(reason)")
-        }
-        let comment = try string("Comment")
-        var port: Int?
-        if let raw = entry["Port"] {
-            guard let number = raw as? Int, (1...65535).contains(number) else {
-                throw ParseError.invalidEntry(index: index, reason: "Port must be a number from 1 to 65535")
-            }
-            port = number
-        }
-        guard host != nil || address != nil || port != nil || bundleID != nil || path != nil else {
-            throw ParseError.invalidEntry(index: index, reason: "it names no Host, Address, Port, BundleID or Path, so it would allow everything")
-        }
-        // A bundle id alone is a claim anyone can put in an Info.plist. Only
-        // the signing team makes it an identity (#351, #364).
-        if bundleID != nil, teamID == nil {
-            throw ParseError.invalidEntry(index: index, reason: "BundleID needs the TeamID that signs the app")
-        }
-        if teamID != nil, bundleID == nil {
-            throw ParseError.invalidEntry(index: index, reason: "TeamID applies to a BundleID; name the app's BundleID too")
-        }
-        if let path, !path.hasPrefix("/") {
-            throw ParseError.invalidEntry(index: index, reason: "Path must be absolute")
-        }
-        if let host, host.contains("/") || host.contains(" ") || host == "*" || host.hasPrefix("*.") && host.count <= 2 {
-            throw ParseError.invalidEntry(index: index, reason: "Host must be a name such as example.com or *.example.com")
-        }
-        let scope: RuleScope = bundleID != nil || path != nil ? .process
-            : (host != nil ? .domain : (address != nil ? .ip : .port))
-        return Rule(processBundleId: bundleID, processTeamId: teamID, processPath: path,
-                    remoteHost: host, remoteIP: address, remotePort: port, direction: .outgoing, action: .allow, scope: scope,
-                    priority: 900, groupName: groupName,
-                    notes: comment.map { "Fail-closed recovery: \($0)" } ?? "Fail-closed recovery")
     }
 }
