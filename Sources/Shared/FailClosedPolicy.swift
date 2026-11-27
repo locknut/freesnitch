@@ -1,0 +1,142 @@
+import Foundation
+
+/// Opt-in fail-closed for the network extension (off by default).
+///
+/// FreeSnitch fails open by design: while the extension holds no policy
+/// (just installed, the app never ran, a saved policy was refused) every flow
+/// is allowed, so a missing app can never become a network outage. A managed
+/// fleet may need the opposite: with no policy in force, only a short
+/// recovery list gets through (remote support, the MDM, the identity
+/// provider, the tunnel client, Apple's device management and time), and
+/// everything else is denied until the helper or the app delivers a policy.
+///
+/// It is read from the content filter's provider configuration under
+/// `vendorConfigurationKey`, which an MDM `com.apple.webcontent-filter`
+/// payload sets through its `VendorConfig` dictionary, so it is in force from
+/// the extension's first flow, before any app or helper exists.
+public struct FailClosedPolicy: Equatable, Sendable {
+    public static let vendorConfigurationKey = "io.isaaclins.freesnitch.failClosed"
+
+    public var enabled: Bool
+    /// The administrator's recovery entries, already turned into allow rules.
+    public var recoveryRules: [Rule]
+    /// Optional: a policy not delivered again within this many seconds is
+    /// treated as no policy, so the recovery policy applies. Meant for fleets
+    /// where the helper delivers policy (it resends every 15 s): if the
+    /// helper stops (crashed, unloaded, removed), the filter does not keep
+    /// enforcing a stale and possibly permissive profile forever. Without
+    /// helper delivery the app sends policy only on changes, so leave this
+    /// unset there.
+    public var maximumPolicyAge: TimeInterval?
+
+    public static let minimumPolicyAge: TimeInterval = 60
+
+    public init(enabled: Bool, recoveryRules: [Rule], maximumPolicyAge: TimeInterval? = nil) {
+        self.enabled = enabled
+        self.recoveryRules = recoveryRules
+        self.maximumPolicyAge = maximumPolicyAge
+    }
+
+    public static let off = FailClosedPolicy(enabled: false, recoveryRules: [])
+
+    /// Whether a policy last delivered `age` seconds ago is too old to keep.
+    public func policyIsStale(age: TimeInterval) -> Bool {
+        guard enabled, let maximumPolicyAge else { return false }
+        return age > maximumPolicyAge
+    }
+
+    /// The rules in force while no policy is: Apple's own device management,
+    /// push, time and captive portal first, then the administrator's entries.
+    /// Evaluated with Silent Deny as the default, so only these get through.
+    public var effectiveRules: [Rule] { Self.builtInRecoveryRules + recoveryRules }
+
+    /// What macOS itself needs to stay manageable and reach a captive
+    /// portal. Pinned to Apple-signed code at system paths (SIP-protected),
+    /// never to a host alone, except the captive portal check host.
+    public static let builtInRecoveryRules: [Rule] = {
+        let applePaths = [
+            "/usr/libexec/mdmclient",                 // MDM check-in and commands
+            "/System/Library/PrivateFrameworks/ApplePushService.framework", // apsd (APNs)
+            "/usr/libexec/timed",                     // network time
+            "/usr/libexec/captiveagent",              // captive portal detection
+            "/System/Library/CoreServices/Captive Network Assistant.app",
+            "/usr/libexec/trustd",                    // certificate revocation (OCSP/CRL)
+        ]
+        var rules = applePaths.map { path in
+            Rule(processPath: path, direction: .outgoing, action: .allow, scope: .process, priority: 1000,
+                 groupName: groupName, notes: "Built-in fail-closed recovery: Apple system service")
+        }
+        rules.append(Rule(remoteHost: "captive.apple.com", direction: .outgoing, action: .allow, scope: .domain,
+                          priority: 1000, groupName: groupName, notes: "Built-in fail-closed recovery: captive portal check"))
+        return rules
+    }()
+
+    public static let groupName = "Fail-closed recovery"
+
+    public enum ParseError: Error, Equatable, LocalizedError {
+        case notADictionary
+        case invalidEntry(index: Int, reason: String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notADictionary: return "the fail-closed configuration is not a dictionary"
+            case .invalidEntry(let index, let reason):
+                return index < 0 ? reason : "recovery entry \(index + 1): \(reason)"
+            }
+        }
+    }
+
+    /// Reads the provider configuration. A missing key is `.off`. A present
+    /// but malformed value throws, and the caller decides; the extension
+    /// keeps fail-closed ON with only the built-in list then, because an
+    /// administrator who asked for fail-closed must not get fail-open from a
+    /// typo.
+    public static func read(fromVendorConfiguration vendor: [String: Any]?) throws -> FailClosedPolicy {
+        guard let value = vendor?[vendorConfigurationKey] else { return .off }
+        return try parse(value)
+    }
+
+    /// The configuration as a property list dictionary:
+    ///
+    ///     Enabled         Bool
+    ///     RecoveryEntries [Dictionary], each with any of:
+    ///         Host      "teamviewer.com" or "*.teamviewer.com"
+    ///         Address   "162.159.197.0/24" (an address or CIDR, for flows
+    ///                   that carry no host name, such as a tunnel's own)
+    ///         Port      5938
+    ///         BundleID  "com.teamviewer.TeamViewer"   (requires TeamID)
+    ///         TeamID    "H7UGFBUGV6", or "apple" for Apple's own code
+    ///         Path      "/Applications/TeamViewer.app" (an app or executable)
+    ///         Comment   free text
+    ///
+    /// The fields of one entry must all match; entries are alternatives.
+    public static func parse(_ value: Any) throws -> FailClosedPolicy {
+        guard let dict = value as? [String: Any] else { throw ParseError.notADictionary }
+        let enabled = (dict["Enabled"] as? Bool) ?? false
+        let entries = (dict["RecoveryEntries"] as? [Any]) ?? []
+        var rules: [Rule] = []
+        for (index, raw) in entries.enumerated() {
+            guard let entry = raw as? [String: Any] else {
+                throw ParseError.invalidEntry(index: index, reason: "not a dictionary")
+            }
+            rules.append(try rule(from: entry, index: index))
+        }
+        var maximumAge: TimeInterval?
+        if let raw = dict["MaximumPolicyAge"] {
+            guard let seconds = raw as? Int, TimeInterval(seconds) >= minimumPolicyAge else {
+                throw ParseError.invalidEntry(index: -1, reason: "MaximumPolicyAge must be a number of seconds, at least \(Int(minimumPolicyAge))")
+            }
+            maximumAge = TimeInterval(seconds)
+        }
+        return FailClosedPolicy(enabled: enabled, recoveryRules: rules, maximumPolicyAge: maximumAge)
+    }
+
+    static func rule(from entry: [String: Any], index: Int) throws -> Rule {
+        do {
+            return try ConfigurationRuleEntry.rule(from: entry, action: .allow, priority: 900, groupName: groupName,
+                                                   notesPrefix: "Fail-closed recovery")
+        } catch let error as ConfigurationRuleEntry.EntryError {
+            throw ParseError.invalidEntry(index: index, reason: error.reason)
+        }
+    }
+}
