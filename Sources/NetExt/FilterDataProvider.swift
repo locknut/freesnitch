@@ -1065,7 +1065,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                 // but it is not a refusal either, because the policy in force
                 // is newer and from the same owner. Reporting it as refused
                 // would have the app restart the filter for nothing.
-                if authority == .sameSession, source == .app, snapshotOrigin == .live, liveSnapshotFromHelper {
+                if case .sameSession? = authority, source == .app, snapshotOrigin == .live, liveSnapshotFromHelper {
                     let status = SharedRuleBridge.SnapshotStatus.ready(for: current)
                     snapshotStatus = status
                     snapshotLock.unlock()

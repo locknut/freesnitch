@@ -35,7 +35,7 @@ grep -Fq 'isEnabled: { [weak self] in self?.helperDeliversPolicy() ?? false }' "
   || fail "the helper delivers policy without a feature that needs it"
 pass "the helper delivers policy only while a helper-driven feature is on"
 
-grep -Fq 'if authority == .sameSession, source == .app, snapshotOrigin == .live, liveSnapshotFromHelper {' "$PROVIDER" \
+grep -Fq 'if case .sameSession? = authority, source == .app, snapshotOrigin == .live, liveSnapshotFromHelper {' "$PROVIDER" \
   || fail "an older app relay is no longer told apart from a rollback"
 grep -Fq 'let status = SharedRuleBridge.SnapshotStatus.ready(for: current)' "$PROVIDER" \
   || fail "the newer policy is not the one reported after an older relay"
