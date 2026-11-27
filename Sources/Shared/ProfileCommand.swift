@@ -56,6 +56,8 @@ public struct ProfileSnapshot: Codable, Sendable {
     public var tunnelConnected: [String]?
     /// The profile a VPN trigger still owes, when activating it failed.
     public var pendingTunnelProfile: String?
+    /// True when MDM sets the triggers, so the app shows them read-only.
+    public var tunnelTriggersManaged: Bool?
 
     public init(profiles: [Profile],
                 activeProfile: String,
@@ -72,7 +74,8 @@ public struct ProfileSnapshot: Codable, Sendable {
                 tunnelTriggers: [TunnelTrigger]? = nil,
                 tunnelServices: [TunnelService]? = nil,
                 tunnelConnected: [String]? = nil,
-                pendingTunnelProfile: String? = nil) {
+                pendingTunnelProfile: String? = nil,
+                tunnelTriggersManaged: Bool? = nil) {
         self.profiles = profiles
         self.activeProfile = activeProfile
         self.alwaysRuleCount = alwaysRuleCount
@@ -89,6 +92,7 @@ public struct ProfileSnapshot: Codable, Sendable {
         self.tunnelServices = tunnelServices
         self.tunnelConnected = tunnelConnected
         self.pendingTunnelProfile = pendingTunnelProfile
+        self.tunnelTriggersManaged = tunnelTriggersManaged
     }
 
     /// True when the current network is already bound to the active profile,
@@ -173,6 +177,8 @@ public final class ProfileCommandService: @unchecked Sendable {
     /// authoritative snapshot. It affects new flows only; nothing here touches
     /// an established connection.
     public var onPolicyChanged: ((ProfilePolicy) -> Void)?
+    /// Whether MDM sets the VPN triggers; reported in every snapshot.
+    public var tunnelTriggersManaged: (() -> Bool)?
     /// The VPN services the helper sees; reported in every snapshot.
     public var tunnelServices: (() -> [TunnelService])?
 
@@ -279,7 +285,8 @@ public final class ProfileCommandService: @unchecked Sendable {
             tunnelTriggers: try? coordinator.tunnelTriggers(),
             tunnelServices: tunnelServices?() ?? [],
             tunnelConnected: coordinator.currentTunnelConnected.map { $0.sorted() },
-            pendingTunnelProfile: coordinator.pendingTunnelSwitch?.profile
+            pendingTunnelProfile: coordinator.pendingTunnelSwitch?.profile,
+            tunnelTriggersManaged: tunnelTriggersManaged?() ?? false
         )
     }
 

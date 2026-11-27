@@ -181,7 +181,7 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     private let profileQueue = DispatchQueue(label: "io.isaaclins.freesnitch.profiles", qos: .userInitiated)
     /// Watches which VPN services own the default route. Always running,
     /// because it only observes; it switches profiles only when a VPN
-    /// trigger the user created matches the state it settles.
+    /// trigger the user or MDM created matches the state it settles.
     private let tunnelMonitor = TunnelMonitor()
     /// For listing the VPN services in the app while the monitor is off
     /// (no triggers): read on demand, nothing remembered.
@@ -196,6 +196,15 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     /// Delivers policy to the network extension without the app, while a
     /// helper-driven feature needs it. Set once in `init`.
     private var extensionPusher: ExtensionPolicyPusher?
+    /// MDM-managed settings (`/Library/Managed Preferences`). `.none` until
+    /// the watcher has read them, and whenever no profile delivers any.
+    private let managedWatcher = ManagedPreferencesWatcher()
+    private let managedLock = NSLock()
+    private var managedStorage = ManagedPreferences.none
+    private var managed: ManagedPreferences {
+        managedLock.lock(); defer { managedLock.unlock() }
+        return managedStorage
+    }
     private let dns = DNSProxy()
     private let netmon = NetMonitor()
     private let recentNames = RecentHostNames()
@@ -427,6 +436,27 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
             },
             isEnabled: { [weak self] in self?.helperDeliversPolicy() ?? false })
 
+        // Managed VPN triggers replace the stored ones, and cannot be changed
+        // from the app while they are managed.
+        let storeRef = store
+        profileCoordinator.tunnelTriggers = { [weak self] in
+            if let managed = self?.managed.tunnelTriggers { return managed }
+            return try storeRef.tunnelTriggers()
+        }
+        profileCoordinator.triggerEditRefusal = { [weak self] in
+            self?.managed.tunnelTriggers != nil ? "VPN triggers are set by MDM" : nil
+        }
+        // With LockSettings, a profile a managed trigger chose stays until
+        // another trigger wins; the user cannot pick another.
+        profileCoordinator.userSwitchRefusal = { [weak self] in
+            guard let self else { return nil }
+            let managed = self.managed
+            guard managed.lockSettings, let triggers = managed.tunnelTriggers,
+                  let connected = self.profileCoordinator.currentTunnelConnected,
+                  TunnelTrigger.winner(triggers, connected: connected) != nil else { return nil }
+            return "the profile follows a VPN trigger set by MDM"
+        }
+        profiles.tunnelTriggersManaged = { [weak self] in self?.managed.tunnelTriggers != nil }
         // Every VPN service seen so far, plus any a trigger names, so a VPN
         // that is down (and whose service macOS removed) can still be chosen.
         profiles.tunnelServices = { [weak self] in
@@ -442,13 +472,41 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
             }
             return services
         }
+        managedWatcher.onChange = { [weak self] prefs in
+            self?.profileQueue.async { self?.applyManaged(prefs) }
+        }
+    }
+
+    /// Applies a new version of the managed preferences: profiles, bindings
+    /// and rules into the store, then the VPN triggers against the current
+    /// VPN state, then the policy republished. Runs on `profileQueue`.
+    private func applyManaged(_ prefs: ManagedPreferences) {
+        managedLock.lock()
+        managedStorage = prefs
+        managedLock.unlock()
+        do {
+            let outcome = try ManagedPolicySync.apply(prefs, to: store)
+            for problem in outcome.problems {
+                PSLog.error(PSLog.helper, "Managed preferences: \(problem)")
+            }
+            if outcome.policyChanged || !outcome.createdProfiles.isEmpty {
+                PSLog.info(PSLog.helper, "Managed rules applied: \(outcome.addedRules) added or updated, "
+                           + "\(outcome.removedRules) removed; profiles created: \(outcome.createdProfiles)")
+                republishActivePolicy()
+            }
+        } catch {
+            PSLog.error(PSLog.helper, "Managed preferences could not be applied: \(error.localizedDescription)")
+        }
+        profileCoordinator.reapplyTunnelState()
+        updateTunnelMonitoring()
+        extensionPusher?.push()
     }
 
     /// Whether the helper hands policy to the extension itself. Only while a
     /// feature that changes policy without the app is turned on, so nothing
     /// changes for anyone who uses neither.
     private func helperDeliversPolicy() -> Bool {
-        (try? profileCoordinator.tunnelTriggers())?.isEmpty == false
+        managed.helperDeliversPolicy || ((try? profileCoordinator.tunnelTriggers())?.isEmpty == false)
     }
 
     func start() {
@@ -470,6 +528,8 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
                 self.startGatewayWatchingIfNeeded()
             }
         }
+        // Managed settings first, so the first VPN state is judged by them.
+        managedWatcher.start()
         profileQueue.async { self.updateTunnelMonitoring() }
         startTunnelRetries()
         extensionPusher?.start()
@@ -485,7 +545,7 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
 
     /// Watches VPNs only while a trigger exists: without one nothing reads or
     /// remembers VPN state. Runs on `profileQueue`; called at start, after a
-    /// trigger command.
+    /// trigger command, and after managed preferences change.
     private func updateTunnelMonitoring() {
         let wanted = (try? profileCoordinator.tunnelTriggers())?.isEmpty == false
         if wanted, !tunnelMonitor.isRunning {
@@ -1133,6 +1193,11 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
 
     func removeRule(idString: String, reply: @escaping (Bool, String?) -> Void) {
         guard let id = UUID(uuidString: idString) else { reply(false, "bad uuid"); return }
+        // MDM put it there and would put it back; say so instead.
+        if ManagedPolicySync.managedRuleIDs(in: store).contains(id) {
+            reply(false, ProfileValidationError.managedByOrganization("this rule is set by MDM").localizedDescription)
+            return
+        }
         do {
             _ = try mutatePolicy { draft in
                 draft.rules.removeAll { $0.id == id }

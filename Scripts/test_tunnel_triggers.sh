@@ -99,7 +99,7 @@ try coordinator.removeTunnelTrigger(id: "*|up")
 try coordinator.removeTunnelTrigger(id: "*|down")
 check("with no trigger matching, the gateway binding decides again", store.activeProfileName() == "Office")
 
-// 6. A switch that fails is owed and retried. Here a trigger supplied from elsewhere
+// 6. A switch that fails is owed and retried. Here a (managed) trigger
 //    names a profile that does not exist yet.
 coordinator.tunnelTriggers = { [TunnelTrigger(service: nil, whenConnected: false, profile: "Ghost")] }
 _ = try coordinator.activate(profileName: "Work", reason: .user)
@@ -179,13 +179,18 @@ check("an unreadable list changes nothing on a VPN change", coordinator.applyObs
 check("and the gateway binding decides", coordinator.applyObservedGatewayMAC("aa:bb:cc:dd:ee:03") && coordinator.applyObservedGatewayMAC(officeMAC)
       && store.activeProfileName() == "Office")
 
+// 8. Edits can be refused (MDM).
 coordinator.tunnelTriggers = { try store.tunnelTriggers() }
+coordinator.triggerEditRefusal = { "VPN triggers are set by MDM" }
+do { try coordinator.setTunnelTrigger(TunnelTrigger(service: nil, whenConnected: true, profile: "Work")); check("a refused edit throws", false) }
+catch { check("a refused edit throws: \(error.localizedDescription)", true) }
 
 // 9. A named VPN whose service is completely absent (some clients remove
 //    their service when disconnected) is "not connected".
 let absent = TunnelTrigger(service: "CloudflareWARP", whenConnected: false, profile: "Restricted")
 check("a named VPN that is absent matches its not-connected trigger", absent.matches([]) && absent.matches([office]))
 check("and wins over any-VPN-not-connected", TunnelTrigger.winner([anyDown, absent], connected: []) == absent)
+coordinator.triggerEditRefusal = nil
 _ = try coordinator.activate(profileName: "Office", reason: .user)
 check("set up: no trigger, the user's pick", coordinator.applyObservedTunnelState([travel]) && store.activeProfileName() == "Office")
 try coordinator.setTunnelTrigger(absent)
