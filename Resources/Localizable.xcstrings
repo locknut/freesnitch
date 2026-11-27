@@ -24,6 +24,16 @@
         }
       }
     },
+    "%@ (not connected)" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (не подключён)"
+          }
+        }
+      }
+    },
     "%@ A disabled rule for this row exists; pressing this enables it." : {
       "localizations" : {
         "ru" : {
@@ -2625,6 +2635,46 @@
         }
       }
     },
+    "Activate when" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Включать, когда"
+          }
+        }
+      }
+    },
+    "Adding this moves the condition from %@." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При добавлении это условие будет снято с профиля %@."
+          }
+        }
+      }
+    },
+    "any VPN" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "любой VPN"
+          }
+        }
+      }
+    },
+    "Any VPN" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Любой VPN"
+          }
+        }
+      }
+    },
     "ASN" : {
       "localizations" : {
         "ru" : {
@@ -4274,6 +4324,16 @@
         }
       }
     },
+    "Carrying this Mac's traffic now: %@." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сейчас трафик этого Mac идёт через: %@."
+          }
+        }
+      }
+    },
     "Categories" : {
       "localizations" : {
         "ru" : {
@@ -4521,6 +4581,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Подключено"
+          }
+        }
+      }
+    },
+    "connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "подключён"
           }
         }
       }
@@ -6297,6 +6367,16 @@
         }
       }
     },
+    "FreeSnitch has not read the VPN state yet." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "FreeSnitch ещё не прочитал состояние VPN."
+          }
+        }
+      }
+    },
     "FreeSnitch has not seen the address for this destination yet." : {
       "localizations" : {
         "ru" : {
@@ -6964,6 +7044,16 @@
         }
       }
     },
+    "is" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "—"
+          }
+        }
+      }
+    },
     "It is approved but not responding. FreeSnitch is restarting it. If macOS asks, authorize the restart. The enabled service is never unregistered and your approval stays intact." : {
       "localizations" : {
         "ru" : {
@@ -7104,12 +7194,62 @@
         }
       }
     },
+    "Managed by your organization." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Управляется вашей организацией."
+          }
+        }
+      }
+    },
+    "No VPN carries this Mac's traffic right now." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сейчас трафик этого Mac не идёт через VPN."
+          }
+        }
+      }
+    },
+    "not connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "не подключён"
+          }
+        }
+      }
+    },
     "Repairing…" : {
       "localizations" : {
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Восстановление…"
+          }
+        }
+      }
+    },
+    "State" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Состояние"
+          }
+        }
+      }
+    },
+    "Switch to %@ whenever this is true. A VPN counts as connected while it carries this Mac's default traffic." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Переключаться на %@, когда это условие выполняется. VPN считается подключённым, пока через него идёт основной трафик этого Mac."
           }
         }
       }
@@ -7956,6 +8096,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "В этой сети не виден MAC-адрес шлюза: %@"
+          }
+        }
+      }
+    },
+    "The VPN trigger was not saved: %@." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Условие VPN не сохранено: %@."
+          }
+        }
+      }
+    },
+    "This is managed by your organization: %@." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Этим управляет ваша организация: %@."
           }
         }
       }
@@ -13965,6 +14125,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Веб-контент (Safari и другие приложения)"
+          }
+        }
+      }
+    },
+    "When %@ is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Когда %@ подключён"
+          }
+        }
+      }
+    },
+    "When %@ is not connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Когда %@ не подключён"
           }
         }
       }
