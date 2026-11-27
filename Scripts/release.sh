@@ -588,6 +588,11 @@ verify_app_bundle() {
   cli_signature="$(codesign -dv --verbose=4 "$CLI_BINARY" 2>&1 || true)"
   grep -Fq "Identifier=$APP_BUNDLE_ID.cli" <<<"$cli_signature" || \
     die "$CLI_BINARY has the wrong signing identifier"
+  # The extension accepts policy from the helper by this identifier.
+  local helper_signature
+  helper_signature="$(codesign -dv --verbose=4 "$HELPER_BINARY" 2>&1 || true)"
+  grep -Fq "Identifier=$APP_BUNDLE_ID.helper" <<<"$helper_signature" || \
+    die "$HELPER_BINARY has the wrong signing identifier"
   assert_framework_code_signatures
   codesign --verify --strict --verbose=2 "$HELPER_BINARY" >/dev/null || die "helper signature verification failed"
   codesign --verify --strict --verbose=2 "$NETEXT_BUNDLE" >/dev/null || die "system extension signature verification failed"

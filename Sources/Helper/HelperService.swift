@@ -179,6 +179,23 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     private let profiles: ProfileCommandService
     private let profileCoordinator: ProfileCoordinator
     private let profileQueue = DispatchQueue(label: "io.isaaclins.freesnitch.profiles", qos: .userInitiated)
+    /// Watches which VPN services own the default route. Always running,
+    /// because it only observes; it switches profiles only when a VPN
+    /// trigger the user created matches the state it settles.
+    private let tunnelMonitor = TunnelMonitor()
+    /// For listing the VPN services in the app while the monitor is off
+    /// (no triggers): read on demand, nothing remembered.
+    private let tunnelReader = SystemTunnelEnvironmentReader()
+    /// Whether gateway watching has started. With VPN triggers it waits for
+    /// the first VPN state, so a helper start with a VPN up switches once.
+    /// Guarded by `profileQueue`.
+    private var gatewayWatchStarted = false
+    /// Retries a VPN trigger switch, or handing the profile back to the
+    /// gateway, that failed. Guarded by `profileQueue`.
+    private var tunnelRetryTimer: DispatchSourceTimer?
+    /// Delivers policy to the network extension without the app, while a
+    /// helper-driven feature needs it. Set once in `init`.
+    private var extensionPusher: ExtensionPolicyPusher?
     private let dns = DNSProxy()
     private let netmon = NetMonitor()
     private let recentNames = RecentHostNames()
@@ -222,6 +239,8 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     private let diagnosticsLock = NSLock()
     private var mode: AppMode = .alert
     private var policyGeneration: UInt64 = 0
+    /// The helper session of the adopted policy. Guarded by `policyQueue`.
+    private var policyEpoch: UInt64 = 0
     /// How many rules the last adopted policy carries. Status reports this
     /// when a fresh read fails, instead of a count of zero that would claim
     /// the user's rules are gone (#279).
@@ -257,6 +276,7 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
         let persistedPolicy = try store.activePolicyState()
         self.mode = persistedPolicy.mode
         self.policyGeneration = persistedPolicy.generation
+        self.policyEpoch = persistedPolicy.epoch
         self.adoptedRuleCount = persistedPolicy.rules.count
         self.blocklists = BlocklistManager(store: store)
         let coordinator = ProfileCoordinator(store: store)
@@ -395,6 +415,40 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
         }
 
         listener.delegate = self
+
+        extensionPusher = ExtensionPolicyPusher(
+            snapshot: { [weak self] in
+                guard let self else { throw CocoaError(.featureUnsupported) }
+                return try SharedRuleBridge.encode(try self.authoritativeSnapshot())
+            },
+            current: { [weak self] in
+                guard let self else { return nil }
+                return self.policyQueue.sync { (epoch: self.policyEpoch, generation: self.policyGeneration) }
+            },
+            isEnabled: { [weak self] in self?.helperDeliversPolicy() ?? false })
+
+        // Every VPN service seen so far, plus any a trigger names, so a VPN
+        // that is down (and whose service macOS removed) can still be chosen.
+        profiles.tunnelServices = { [weak self] in
+            guard let self else { return [] }
+            // With triggers, the monitor runs and remembers what it saw; without,
+            // the services present now are read once, and nothing is kept.
+            var services = self.tunnelMonitor.isRunning
+                ? KnownTunnelServices.all(in: self.store)
+                : TunnelStatus.evaluate(self.tunnelReader.read(probe: .standard)).services
+            for id in ((try? self.profileCoordinator.tunnelTriggers()) ?? []).compactMap(\.service)
+            where !services.contains(where: { $0.id == id }) {
+                services.append(TunnelService(id: id, name: nil))
+            }
+            return services
+        }
+    }
+
+    /// Whether the helper hands policy to the extension itself. Only while a
+    /// feature that changes policy without the app is turned on, so nothing
+    /// changes for anyone who uses neither.
+    private func helperDeliversPolicy() -> Bool {
+        (try? profileCoordinator.tunnelTriggers())?.isEmpty == false
     }
 
     func start() {
@@ -404,8 +458,61 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
         netmon.start()
         startInsightsMaintenance()
         startBlocklistSchedule()
-        // Only a binding the user created can ever switch the active profile.
+        tunnelMonitor.onChange = { [weak self] state in
+            guard let self else { return }
+            PSLog.info(PSLog.helper, state.connected.isEmpty ? "No VPN owns the default route."
+                       : "VPN services owning the default route: \(state.connected.sorted().joined(separator: ", ")).")
+            self.profileQueue.async {
+                do { try KnownTunnelServices.remember(state.services, in: self.store) } catch {
+                    PSLog.error(PSLog.helper, "VPN services seen could not be remembered: \(error.localizedDescription)")
+                }
+                _ = self.profileCoordinator.applyObservedTunnelState(state.connected)
+                self.startGatewayWatchingIfNeeded()
+            }
+        }
+        profileQueue.async { self.updateTunnelMonitoring() }
+        startTunnelRetries()
+        extensionPusher?.start()
+    }
+
+    /// Only a binding the user created can ever switch the active profile.
+    /// Runs on `profileQueue`.
+    private func startGatewayWatchingIfNeeded() {
+        guard !gatewayWatchStarted else { return }
+        gatewayWatchStarted = true
         profileCoordinator.startWatchingNetworks()
+    }
+
+    /// Watches VPNs only while a trigger exists: without one nothing reads or
+    /// remembers VPN state. Runs on `profileQueue`; called at start, after a
+    /// trigger command.
+    private func updateTunnelMonitoring() {
+        let wanted = (try? profileCoordinator.tunnelTriggers())?.isEmpty == false
+        if wanted, !tunnelMonitor.isRunning {
+            tunnelMonitor.start()
+            // If the first VPN state takes unusually long, networks are still
+            // watched.
+            profileQueue.asyncAfter(deadline: .now() + 6) { [weak self] in self?.startGatewayWatchingIfNeeded() }
+        } else if !wanted, tunnelMonitor.isRunning {
+            tunnelMonitor.stop()
+        }
+        if !wanted { startGatewayWatchingIfNeeded() }
+    }
+
+    /// Retries a failed VPN trigger switch, or a failed hand-back to the
+    /// gateway, every few seconds until it works or the VPN state changes.
+    private func startTunnelRetries() {
+        profileQueue.async { [self] in
+            let timer = DispatchSource.makeTimerSource(queue: profileQueue)
+            timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .seconds(1))
+            timer.setEventHandler { [weak self] in
+                guard let self, self.profileCoordinator.tunnelRetryOwed,
+                      let connected = self.profileCoordinator.currentTunnelConnected else { return }
+                _ = self.profileCoordinator.applyObservedTunnelState(connected)
+            }
+            timer.resume()
+            tunnelRetryTimer = timer
+        }
     }
 
     /// Republishes the active profile's policy to the DNS proxy and tells
@@ -447,6 +554,7 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
         broadcast { client in
             client.notifyLog(level: "info", message: AppConstants.profilePolicyChangedLogMessage)
         }
+        extensionPusher?.push()
     }
 
     /// The resolvers that must stay reachable no matter what any feed lists.
@@ -754,6 +862,7 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     private func adoptLocked(_ state: RuleStore.PolicyState) {
         mode = state.mode
         policyGeneration = state.generation
+        policyEpoch = state.epoch
         adoptedRuleCount = state.rules.count
         do {
             try store.recordPolicyGeneration(atLeast: state.generation)
@@ -1703,6 +1812,8 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
             }
             let (data, message) = self.profiles.handle(requestData: request)
             reply(data, message)
+            // A trigger added or removed starts or stops VPN watching.
+            self.updateTunnelMonitoring()
         }
     }
 

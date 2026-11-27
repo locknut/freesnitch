@@ -30,9 +30,17 @@ public final class IPCConnection: NSObject, @unchecked Sendable {
     private var currentConnection: NSXPCConnection?
     private let connectionLock = NSLock()
     private weak var delegate: AppCommunication?
+    /// Who handed over a snapshot. The extension treats both as the same
+    /// helper-owned policy; the source only decides how a race between them
+    /// is reported (see `FilterDataProvider.receiveSnapshot`).
+    public enum SnapshotSource: Sendable {
+        case app
+        case helper
+    }
+
     /// Extension side: invoked when the app pushes a rule set. It returns the
     /// provider's resulting status synchronously so the app can publish it.
-    public var onSnapshot: ((Data) -> SharedRuleBridge.SnapshotStatus)?
+    public var onSnapshot: ((Data, SnapshotSource) -> SharedRuleBridge.SnapshotStatus)?
     /// Extension side: supplies the current status during registration.
     public var snapshotStatus: (() -> SharedRuleBridge.SnapshotStatus)?
     /// App side: the connection made by `register` was interrupted or
@@ -202,17 +210,24 @@ public final class IPCConnection: NSObject, @unchecked Sendable {
 
 extension IPCConnection: NSXPCListenerDelegate {
     public func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
-        guard XPCPeerValidator.isTrustedGUI(newConnection) else {
-            PSLog.error(PSLog.netext,
-                        "SECURITY: rejected XPC peer failing the FreeSnitch GUI code requirement "
-                        + "(pid \(newConnection.processIdentifier)); no snapshot was accepted and "
-                        + "filtering will fail open if no trusted GUI is connected.")
-            return false
+        // The helper is checked against its own, narrower requirement; every
+        // other peer must pass the GUI's.
+        let fromHelper = XPCPeerValidator.isTrustedHelper(newConnection)
+        if !fromHelper {
+            guard XPCPeerValidator.isTrustedGUI(newConnection) else {
+                PSLog.error(PSLog.netext,
+                            "SECURITY: rejected XPC peer failing the FreeSnitch GUI code requirement "
+                            + "(pid \(newConnection.processIdentifier)); no snapshot was accepted and "
+                            + "filtering will fail open if no trusted GUI is connected.")
+                return false
+            }
         }
         // Extension side: the signed GUI connected. Export ProviderCommunication
-        // and keep the connection so we can call promptUser on it later.
+        // and keep the connection so we can call promptUser on it later. Who
+        // the peer is was decided here, once, from its verified identity, and
+        // travels with every snapshot it sends.
         newConnection.exportedInterface = NSXPCInterface(with: ProviderCommunication.self)
-        newConnection.exportedObject = self
+        newConnection.exportedObject = ProviderEndpoint(owner: self, source: fromHelper ? .helper : .app)
         newConnection.remoteObjectInterface = NSXPCInterface(with: AppCommunication.self)
         newConnection.invalidationHandler = { [weak self, weak newConnection] in
             self?.clearCurrentConnection(newConnection)
@@ -222,7 +237,8 @@ extension IPCConnection: NSXPCListenerDelegate {
         }
         // A CLI connection is allowed to inspect and update snapshots, but it
         // must not replace the GUI connection that answers interactive alerts.
-        if !XPCPeerValidator.isCLI(newConnection) {
+        // The helper delivers policy only; it has no alert window either.
+        if !fromHelper && !XPCPeerValidator.isCLI(newConnection) {
             setCurrentConnection(newConnection)
         }
         newConnection.resume()
@@ -275,8 +291,36 @@ extension IPCConnection: ProviderCommunication {
         snapshotJSON: Data,
         completionHandler: @escaping (Data) -> Void
     ) {
-        let status = onSnapshot?(snapshotJSON)
+        updateSnapshot(snapshotJSON: snapshotJSON, source: .app, completionHandler: completionHandler)
+    }
+
+    fileprivate func updateSnapshot(snapshotJSON: Data, source: SnapshotSource,
+                                    completionHandler: @escaping (Data) -> Void) {
+        let status = onSnapshot?(snapshotJSON, source)
             ?? .unavailable(String(localized: "Network extension is not ready to receive rule snapshots."))
         completionHandler(Self.encodeStatus(status))
+    }
+}
+
+/// The object one accepted connection talks to. It carries the source
+/// decided when the connection was accepted, so a snapshot's sender is never
+/// re-derived from the peer's on-disk code later.
+private final class ProviderEndpoint: NSObject, ProviderCommunication {
+    private weak var owner: IPCConnection?
+    private let source: IPCConnection.SnapshotSource
+
+    init(owner: IPCConnection, source: IPCConnection.SnapshotSource) {
+        self.owner = owner
+        self.source = source
+    }
+
+    func register(_ completionHandler: @escaping (Bool, Data) -> Void) {
+        guard let owner else { completionHandler(false, Data()); return }
+        owner.register(completionHandler)
+    }
+
+    func updateSnapshot(snapshotJSON: Data, completionHandler: @escaping (Data) -> Void) {
+        guard let owner else { completionHandler(Data()); return }
+        owner.updateSnapshot(snapshotJSON: snapshotJSON, source: source, completionHandler: completionHandler)
     }
 }

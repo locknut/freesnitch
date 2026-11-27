@@ -281,6 +281,14 @@ public final class RuleStore: @unchecked Sendable {
             created_at REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS profile_tunnel_triggers (
+            condition TEXT PRIMARY KEY,
+            service_id TEXT,
+            when_connected INTEGER NOT NULL,
+            profile_name TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -895,6 +903,10 @@ public final class RuleStore: @unchecked Sendable {
                         sqlite3_bind_text(stmt, 1, normalizedName, -1, SQLITE_TRANSIENT)
                         sqlite3_bind_text(stmt, 2, current.name, -1, SQLITE_TRANSIENT)
                     }
+                    try executeLocked("UPDATE profile_tunnel_triggers SET profile_name=? WHERE profile_name=?;") { stmt in
+                        sqlite3_bind_text(stmt, 1, normalizedName, -1, SQLITE_TRANSIENT)
+                        sqlite3_bind_text(stmt, 2, current.name, -1, SQLITE_TRANSIENT)
+                    }
                     try executeLocked("UPDATE profile_blocklists SET profile_name=? WHERE profile_name=?;") { stmt in
                         sqlite3_bind_text(stmt, 1, normalizedName, -1, SQLITE_TRANSIENT)
                         sqlite3_bind_text(stmt, 2, current.name, -1, SQLITE_TRANSIENT)
@@ -945,6 +957,9 @@ public final class RuleStore: @unchecked Sendable {
                     sqlite3_bind_text(stmt, 1, profile.name, -1, SQLITE_TRANSIENT)
                 }
                 try executeLocked("DELETE FROM profile_network_bindings WHERE profile_name=?;") { stmt in
+                    sqlite3_bind_text(stmt, 1, profile.name, -1, SQLITE_TRANSIENT)
+                }
+                try executeLocked("DELETE FROM profile_tunnel_triggers WHERE profile_name=?;") { stmt in
                     sqlite3_bind_text(stmt, 1, profile.name, -1, SQLITE_TRANSIENT)
                 }
                 try executeLocked("DELETE FROM profiles WHERE id=?;") { stmt in
@@ -1561,6 +1576,66 @@ public final class RuleStore: @unchecked Sendable {
 
     public func allNetworkBindings() -> [ProfileNetworkBinding] {
         queue.sync { allNetworkBindingsLocked() }
+    }
+
+    // MARK: - VPN triggers
+
+    /// The stored VPN triggers. A failed read throws: it is not the same as
+    /// no triggers, and saving over it would lose them.
+    public func tunnelTriggers() throws -> [TunnelTrigger] {
+        try queue.sync { try tunnelTriggersLocked() }
+    }
+
+    /// Adds a trigger, replacing the one with the same condition (a condition
+    /// selects one profile, as a gateway does). Renaming the profile carries
+    /// it along; deleting the profile deletes it.
+    @discardableResult
+    public func setTunnelTrigger(_ trigger: TunnelTrigger) throws -> [TunnelTrigger] {
+        try TunnelTrigger.validate(trigger)
+        return try queue.sync {
+            guard let profile = profileLocked(named: trigger.profile) else {
+                throw ProfileValidationError.invalidTunnelTrigger("there is no profile named \(trigger.profile)")
+            }
+            let existing = try tunnelTriggersLocked()
+            if existing.count >= TunnelTrigger.maximumCount, !existing.contains(where: { $0.id == trigger.id }) {
+                throw ProfileValidationError.invalidTunnelTrigger("at most \(TunnelTrigger.maximumCount) VPN triggers can be set")
+            }
+            try executeLocked("INSERT OR REPLACE INTO profile_tunnel_triggers(condition,service_id,when_connected,profile_name,created_at) VALUES(?,?,?,?,?);") { stmt in
+                sqlite3_bind_text(stmt, 1, trigger.id, -1, SQLITE_TRANSIENT)
+                bindOpt(stmt, 2, trigger.service)
+                sqlite3_bind_int(stmt, 3, trigger.whenConnected ? 1 : 0)
+                sqlite3_bind_text(stmt, 4, profile.name, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_double(stmt, 5, Date().timeIntervalSince1970)
+            }
+            return try tunnelTriggersLocked()
+        }
+    }
+
+    @discardableResult
+    public func removeTunnelTrigger(id: String) throws -> [TunnelTrigger] {
+        try queue.sync {
+            try executeLocked("DELETE FROM profile_tunnel_triggers WHERE condition=?;") { stmt in
+                sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT)
+            }
+            return try tunnelTriggersLocked()
+        }
+    }
+
+    private func tunnelTriggersLocked() throws -> [TunnelTrigger] {
+        var stmt: OpaquePointer?
+        defer { if stmt != nil { sqlite3_finalize(stmt) } }
+        guard sqlite3_prepare_v2(db, "SELECT service_id,when_connected,profile_name FROM profile_tunnel_triggers ORDER BY condition;", -1, &stmt, nil) == SQLITE_OK else {
+            throw sqliteErrorLocked(code: 2)
+        }
+        var out: [TunnelTrigger] = []
+        while true {
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else { throw sqliteErrorLocked(code: 2) }
+            let service = sqlite3_column_type(stmt, 0) == SQLITE_NULL ? nil : text(stmt, 0)
+            out.append(TunnelTrigger(service: service, whenConnected: sqlite3_column_int(stmt, 1) != 0, profile: text(stmt, 2)))
+        }
+        return out
     }
 
     public func recordConnection(_ c: Connection) throws {

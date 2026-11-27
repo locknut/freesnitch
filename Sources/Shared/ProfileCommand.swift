@@ -24,6 +24,10 @@ public enum ProfileCommand: Codable, Sendable {
     case refreshBlocklists
     case bindCurrentNetwork(profileName: String)
     case unbindNetwork(gatewayMAC: String)
+    /// Adds a VPN trigger (replacing one with the same condition) and applies
+    /// the triggers to the current VPN state at once.
+    case setTunnelTrigger(TunnelTrigger)
+    case removeTunnelTrigger(id: String)
 }
 
 /// A complete view of profile state. Every command answers with the same
@@ -43,6 +47,15 @@ public struct ProfileSnapshot: Codable, Sendable {
     public var pendingNetworkSwitch: PendingNetworkSwitch?
     /// Why no gateway MAC is visible, when reading it failed.
     public var gatewayReadProblem: ProfileProblem?
+    /// The VPN triggers. Nil from a helper that predates them.
+    public var tunnelTriggers: [TunnelTrigger]?
+    /// The VPN services present on this Mac, for choosing one in a trigger.
+    public var tunnelServices: [TunnelService]?
+    /// The services that own the default route, as the helper last settled
+    /// it. Nil before the first reading, or from an older helper.
+    public var tunnelConnected: [String]?
+    /// The profile a VPN trigger still owes, when activating it failed.
+    public var pendingTunnelProfile: String?
 
     public init(profiles: [Profile],
                 activeProfile: String,
@@ -55,7 +68,11 @@ public struct ProfileSnapshot: Codable, Sendable {
                 notice: ProfileSwitchNotice?,
                 canUndo: Bool,
                 pendingNetworkSwitch: PendingNetworkSwitch? = nil,
-                gatewayReadProblem: ProfileProblem? = nil) {
+                gatewayReadProblem: ProfileProblem? = nil,
+                tunnelTriggers: [TunnelTrigger]? = nil,
+                tunnelServices: [TunnelService]? = nil,
+                tunnelConnected: [String]? = nil,
+                pendingTunnelProfile: String? = nil) {
         self.profiles = profiles
         self.activeProfile = activeProfile
         self.alwaysRuleCount = alwaysRuleCount
@@ -68,6 +85,10 @@ public struct ProfileSnapshot: Codable, Sendable {
         self.canUndo = canUndo
         self.pendingNetworkSwitch = pendingNetworkSwitch
         self.gatewayReadProblem = gatewayReadProblem
+        self.tunnelTriggers = tunnelTriggers
+        self.tunnelServices = tunnelServices
+        self.tunnelConnected = tunnelConnected
+        self.pendingTunnelProfile = pendingTunnelProfile
     }
 
     /// True when the current network is already bound to the active profile,
@@ -152,6 +173,8 @@ public final class ProfileCommandService: @unchecked Sendable {
     /// authoritative snapshot. It affects new flows only; nothing here touches
     /// an established connection.
     public var onPolicyChanged: ((ProfilePolicy) -> Void)?
+    /// The VPN services the helper sees; reported in every snapshot.
+    public var tunnelServices: (() -> [TunnelService])?
 
     public init(store: RuleStore, coordinator: ProfileCoordinator) {
         self.store = store
@@ -227,6 +250,10 @@ public final class ProfileCommandService: @unchecked Sendable {
             _ = try coordinator.bindCurrentNetwork(toProfile: profileName)
         case .unbindNetwork(let gatewayMAC):
             try coordinator.unbindNetwork(gatewayMAC: gatewayMAC)
+        case .setTunnelTrigger(let trigger):
+            try coordinator.setTunnelTrigger(trigger)
+        case .removeTunnelTrigger(let id):
+            try coordinator.removeTunnelTrigger(id: id)
         }
         return try snapshot()
     }
@@ -248,7 +275,11 @@ public final class ProfileCommandService: @unchecked Sendable {
             notice: notice,
             canUndo: coordinator.canUndo,
             pendingNetworkSwitch: coordinator.pendingNetworkSwitch,
-            gatewayReadProblem: coordinator.gatewayReadProblem
+            gatewayReadProblem: coordinator.gatewayReadProblem,
+            tunnelTriggers: try? coordinator.tunnelTriggers(),
+            tunnelServices: tunnelServices?() ?? [],
+            tunnelConnected: coordinator.currentTunnelConnected.map { $0.sorted() },
+            pendingTunnelProfile: coordinator.pendingTunnelSwitch?.profile
         )
     }
 

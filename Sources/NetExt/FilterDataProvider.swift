@@ -250,11 +250,11 @@ final class FilterDataProvider: NEFilterDataProvider {
     }
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
-        IPCConnection.shared.onSnapshot = { [weak self] data in
+        IPCConnection.shared.onSnapshot = { [weak self] data, source in
             guard let self else {
                 return .unavailable("Network extension stopped before receiving the rule snapshot.")
             }
-            return self.receiveSnapshot(data)
+            return self.receiveSnapshot(data, from: source)
         }
         IPCConnection.shared.snapshotStatus = { [weak self] in
             self?.readSnapshotStatus()
@@ -1018,7 +1018,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
     }
 
-    private func receiveSnapshot(_ data: Data) -> SharedRuleBridge.SnapshotStatus {
+    private func receiveSnapshot(_ data: Data, from source: IPCConnection.SnapshotSource = .app) -> SharedRuleBridge.SnapshotStatus {
         do {
             try RuleTransportBoundary.validateSnapshotBytes(data)
             let received = try SharedRuleBridge.decode(data)
@@ -1050,7 +1050,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                     epoch: current.epoch,
                     rejection: .olderSession
                 )
-                snapshotStatus = status
+                if source == .app { snapshotStatus = status }
                 snapshotLock.unlock()
                 PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an older helper session's snapshot.")
                 return status
@@ -1066,7 +1066,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                         epoch: current.epoch,
                         rejection: .olderGeneration
                     )
-                    snapshotStatus = status
+                    if source == .app { snapshotStatus = status }
                     snapshotLock.unlock()
                     PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an older live rule snapshot.")
                     return status
@@ -1084,7 +1084,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                     epoch: current.epoch,
                     rejection: .conflictingContent
                 )
-                snapshotStatus = status
+                if source == .app { snapshotStatus = status }
                 snapshotLock.unlock()
                 PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an invalid split-brain snapshot.")
                 return status
@@ -1107,7 +1107,12 @@ final class FilterDataProvider: NEFilterDataProvider {
                 // Queued (not written) while the lock is held, so records land
                 // in the order the policies were accepted. The write itself
                 // runs on its own queue and never delays this reply.
-                if decision == .accepted { recordLiveWatermark(accepted) }
+                // Only the app saves the boot policy, so only what the app
+                // delivered may move the watermark the next start compares
+                // the saved policy against. A helper delivery the app never
+                // saved must not make that saved policy look superseded,
+                // which would make the next start fail open.
+                if decision == .accepted, source == .app { recordLiveWatermark(accepted) }
                 snapshotLock.unlock()
 
                 let allowCount = accepted.rules.filter { $0.action == .allow }.count
@@ -1128,7 +1133,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                     epoch: current?.epoch,
                     rejection: .olderGeneration
                 )
-                snapshotStatus = status
+                if source == .app { snapshotStatus = status }
                 snapshotLock.unlock()
                 PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an invalid live snapshot.")
                 return status
@@ -1140,7 +1145,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                     epoch: currentEpoch,
                     rejection: .olderSession
                 )
-                snapshotStatus = status
+                if source == .app { snapshotStatus = status }
                 snapshotLock.unlock()
                 PSLog.error(PSLog.netext, status.message ?? "Network extension rejected an older helper session's snapshot.")
                 return status
@@ -1150,7 +1155,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                 "Network extension received an invalid rule snapshot: \(error.localizedDescription)"
             )
             snapshotLock.lock()
-            snapshotStatus = status
+            if source == .app { snapshotStatus = status }
             snapshotLock.unlock()
             PSLog.error(PSLog.netext, status.message ?? "Network extension received an invalid rule snapshot.")
             return status

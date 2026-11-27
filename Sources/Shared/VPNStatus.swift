@@ -57,9 +57,12 @@ public enum VPNStatus {
     /// `State:/Network/Global/DNS`. Pure, so it is tested with the store
     /// contents of real VPNs.
     ///
-    /// A service counts as a connected VPN when it has a `VPN` entry and an
-    /// IPv4 or IPv6 entry naming its interface: macOS writes the address
-    /// entries only while the tunnel is up. The VPN takes all lookups when the
+    /// A service counts as a connected VPN when it has a `VPN` entry, or is
+    /// a tunnel service as `TunnelStatus` defines it (a tunnel interface with
+    /// a routable address), and an IPv4 or IPv6 entry naming its interface:
+    /// macOS writes the address entries only while the tunnel is up. This is
+    /// about DNS and the Settings banner; it does not ask whether the VPN
+    /// carries all traffic, which is what VPN triggers use. The VPN takes all lookups when the
     /// global DNS configuration came from it, or when its servers are the
     /// global servers.
     public static func connectedVPNs(in store: [String: Any]) -> [ActiveVPN] {
@@ -68,8 +71,11 @@ public enum VPNStatus {
         let globalSource = (globalDNS?["__CONFIGURATION_ID__"] as? String) ?? ""
 
         var result: [ActiveVPN] = []
-        for key in store.keys.sorted() {
-            guard let serviceID = serviceID(of: key, suffix: "/VPN") else { continue }
+        // Some VPN clients publish a service with a tunnel interface but no
+        // VPN entry; those count as VPNs too (see TunnelStatus).
+        let serviceIDs = Set(store.keys.compactMap { serviceID(of: $0, suffix: "/VPN") })
+            .union(TunnelStatus.tunnelServices(in: store).map(\.service.id))
+        for serviceID in serviceIDs.sorted() {
             let base = "State:/Network/Service/\(serviceID)"
             let interface = interfaceName(store["\(base)/IPv4"]) ?? interfaceName(store["\(base)/IPv6"])
             guard let interface else { continue }
@@ -88,7 +94,11 @@ public enum VPNStatus {
             // resolver the user set anyway.
             let sameServers = (match.isEmpty || claimsDefault) && !servers.isEmpty && !globalServers.isEmpty
                 && globalServers.isSubset(of: Set(servers))
-            result.append(ActiveVPN(name: setup?["UserDefinedName"] as? String,
+            // A service with no user-defined name is named by its id, which
+            // such clients choose to be readable.
+            let name = (setup?["UserDefinedName"] as? String)
+                ?? (store["\(base)/VPN"] == nil ? serviceID : nil)
+            result.append(ActiveVPN(name: name,
                                     interface: interface,
                                     dnsServers: servers,
                                     matchDomains: match,

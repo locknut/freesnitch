@@ -94,6 +94,46 @@
         }
       }
     },
+    "%@ is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ подключён"
+          }
+        }
+      }
+    },
+    "%@ is connected (not connected now)" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ подключён (сейчас не подключён)"
+          }
+        }
+      }
+    },
+    "%@ is not connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ не подключён"
+          }
+        }
+      }
+    },
+    "%@ is not connected (connected now)" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ не подключён (сейчас подключён)"
+          }
+        }
+      }
+    },
     "%@ No rule snapshot was delivered; filtering remains fail-open." : {
       "localizations" : {
         "ru" : {
@@ -2525,6 +2565,16 @@
         }
       }
     },
+    "a tunnel no VPN service names" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "туннель без службы VPN"
+          }
+        }
+      }
+    },
     "A VPN" : {
       "localizations" : {
         "ru" : {
@@ -2621,6 +2671,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Для этой строки есть правило, но оно выключено в разделе «Правила» и ничего не решает."
+          }
+        }
+      }
+    },
+    "Activate this profile when" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Включать этот профиль, когда"
+          }
+        }
+      }
+    },
+    "Adding this moves the condition from %@." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При добавлении это условие будет снято с профиля %@."
+          }
+        }
+      }
+    },
+    "Any VPN is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Подключён любой VPN"
           }
         }
       }
@@ -4274,6 +4354,16 @@
         }
       }
     },
+    "Carrying this Mac's traffic now: %@." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сейчас трафик этого Mac идёт через: %@."
+          }
+        }
+      }
+    },
     "Categories" : {
       "localizations" : {
         "ru" : {
@@ -4521,6 +4611,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Подключено"
+          }
+        }
+      }
+    },
+    "connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "подключён"
           }
         }
       }
@@ -4991,6 +5091,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Не удалось сохранить изменения в %@"
+          }
+        }
+      }
+    },
+    "Could not switch to %@ for a VPN condition. FreeSnitch keeps trying." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось переключиться на %@ по условию VPN. FreeSnitch продолжает попытки."
           }
         }
       }
@@ -6297,6 +6407,16 @@
         }
       }
     },
+    "FreeSnitch has not read the VPN state yet." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "FreeSnitch ещё не прочитал состояние VPN."
+          }
+        }
+      }
+    },
     "FreeSnitch has not seen the address for this destination yet." : {
       "localizations" : {
         "ru" : {
@@ -7104,12 +7224,52 @@
         }
       }
     },
+    "No VPN carries this Mac's traffic right now." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сейчас трафик этого Mac не идёт через VPN."
+          }
+        }
+      }
+    },
+    "No VPN is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ни один VPN не подключён"
+          }
+        }
+      }
+    },
+    "not connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "не подключён"
+          }
+        }
+      }
+    },
     "Repairing…" : {
       "localizations" : {
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Восстановление…"
+          }
+        }
+      }
+    },
+    "Switch to %@ whenever this is true. A VPN counts as connected while it carries this Mac's default traffic; a split-tunnel VPN never does. While a VPN condition holds, it decides the profile instead of the network." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Переключаться на %@, когда это условие выполняется. VPN считается подключённым, пока через него идёт основной трафик этого Mac; VPN с раздельным туннелированием — никогда. Пока условие VPN выполняется, профиль определяет оно, а не сеть."
           }
         }
       }
@@ -7956,6 +8116,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "В этой сети не виден MAC-адрес шлюза: %@"
+          }
+        }
+      }
+    },
+    "The VPN trigger was not saved: %@." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Условие VPN не сохранено: %@."
           }
         }
       }
@@ -13965,6 +14135,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Веб-контент (Safari и другие приложения)"
+          }
+        }
+      }
+    },
+    "When %@ is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Когда %@ подключён"
+          }
+        }
+      }
+    },
+    "When %@ is not connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Когда %@ не подключён"
+          }
+        }
+      }
+    },
+    "When any VPN is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Когда подключён любой VPN"
+          }
+        }
+      }
+    },
+    "When no VPN is connected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Когда ни один VPN не подключён"
           }
         }
       }

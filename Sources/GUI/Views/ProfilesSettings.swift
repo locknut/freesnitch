@@ -24,6 +24,8 @@ struct ProfilesSettingsView: View {
     /// glyph, so the list was a column of identical rows (#137).
     @State private var renamingProfile: Profile?
     @State private var renameText = ""
+    /// The condition being composed: `TunnelTrigger.id` of a choice below.
+    @State private var newTriggerCondition = "*|up"
 
     /// Text fields stop at a readable measure instead of spanning the window
     /// (#88). A name is a few words; a URL is longer but still not a window.
@@ -451,7 +453,114 @@ struct ProfilesSettingsView: View {
             .padding(.bottom, 8)
             captionText("FreeSnitch recognises a network by the MAC address of its gateway. It never reads the Wi-Fi name and never asks for Location Services.",
                         tint: .secondary)
+            tunnelRows(profile)
         }
+    }
+
+    /// VPN triggers, shown per profile next to its network bindings:
+    /// "Activate when <VPN> is <connected | not connected>". The VPN is any
+    /// VPN or one of the VPN services this Mac has, by service id.
+    private func tunnelRows(_ profile: Profile) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                // Whole sentences, one per choice, so each translates as one.
+                Picker("Activate this profile when", selection: $newTriggerCondition) {
+                    ForEach(triggerChoices(for: profile)) { choice in
+                        Text(choiceLabel(choice)).tag(choice.id)
+                    }
+                }
+                .fixedSize()
+                Button("Add") {
+                    if let choice = triggerChoices(for: profile).first(where: { $0.id == newTriggerCondition }) {
+                        profileClient.setTunnelTrigger(choice)
+                    }
+                }
+                .help("Switch to \(profile.name) whenever this is true. A VPN counts as connected while it carries this Mac's default traffic; a split-tunnel VPN never does. While a VPN condition holds, it decides the profile instead of the network.")
+            }
+            ForEach(triggers(for: profile)) { trigger in
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.shield").foregroundStyle(Color.accentColor)
+                    Text(triggerLabel(trigger)).font(.caption)
+                    Spacer(minLength: 6)
+                    Button("Remove") { profileClient.removeTunnelTrigger(id: trigger.id) }
+                        .controlSize(.small)
+                }
+            }
+            if let replaced = replacedTrigger(for: profile) {
+                Text("Adding this moves the condition from \(replaced.profile).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let owed = profileClient.snapshot?.pendingTunnelProfile, owed == profile.name {
+                Text("Could not switch to \(owed) for a VPN condition. FreeSnitch keeps trying.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            Text(tunnelStateLabel).font(.caption).foregroundStyle(.secondary)
+        }
+        .controlSize(.small)
+        .disabled(!profileClient.isAvailable || profileClient.snapshot?.tunnelTriggers == nil)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
+    }
+
+    private var tunnelServices: [TunnelService] { profileClient.snapshot?.tunnelServices ?? [] }
+
+    /// Every condition one can add for this profile: any VPN, then each VPN
+    /// service, each connected and not connected.
+    private func triggerChoices(for profile: Profile) -> [TunnelTrigger] {
+        ([nil] + tunnelServices.map { Optional($0.id) }).flatMap { service in
+            [true, false].map { TunnelTrigger(service: service, whenConnected: $0, profile: profile.name) }
+        }
+    }
+
+    private func choiceLabel(_ choice: TunnelTrigger) -> String {
+        guard let id = choice.service else {
+            return choice.whenConnected ? String(localized: "Any VPN is connected")
+                : String(localized: "No VPN is connected")
+        }
+        let service = tunnelServices.first { $0.id == id }
+        let name = service?.displayName ?? id
+        let present = profileClient.snapshot?.tunnelConnected?.contains(id) == true
+        if choice.whenConnected {
+            return present ? String(localized: "\(name) is connected")
+                : String(localized: "\(name) is connected (not connected now)")
+        }
+        return present ? String(localized: "\(name) is not connected (connected now)")
+            : String(localized: "\(name) is not connected")
+    }
+
+    /// "Name", or "Name (not connected)" for a VPN that is not carrying
+    /// traffic now, including one that is down and only remembered.
+    private func serviceName(_ id: String) -> String {
+        if id == TunnelStatus.unlistedTunnelID { return String(localized: "a tunnel no VPN service names") }
+        return tunnelServices.first { $0.id == id }?.displayName ?? id
+    }
+
+    private func triggers(for profile: Profile) -> [TunnelTrigger] {
+        (profileClient.snapshot?.tunnelTriggers ?? []).filter { $0.profile == profile.name }
+    }
+
+    private func triggerLabel(_ trigger: TunnelTrigger) -> String {
+        guard let id = trigger.service else {
+            return trigger.whenConnected ? String(localized: "When any VPN is connected")
+                : String(localized: "When no VPN is connected")
+        }
+        return trigger.whenConnected ? String(localized: "When \(serviceName(id)) is connected")
+            : String(localized: "When \(serviceName(id)) is not connected")
+    }
+
+    /// The trigger another profile holds for the condition being composed.
+    private func replacedTrigger(for profile: Profile) -> TunnelTrigger? {
+        guard let candidate = triggerChoices(for: profile).first(where: { $0.id == newTriggerCondition }) else { return nil }
+        return (profileClient.snapshot?.tunnelTriggers ?? []).first { $0.id == candidate.id && $0.profile != profile.name }
+    }
+
+    private var tunnelStateLabel: String {
+        guard let connected = profileClient.snapshot?.tunnelConnected else {
+            return String(localized: "FreeSnitch has not read the VPN state yet.")
+        }
+        guard !connected.isEmpty else { return String(localized: "No VPN carries this Mac's traffic right now.") }
+        let names = connected.map { serviceName($0) }.joined(separator: ", ")
+        return String(localized: "Carrying this Mac's traffic now: \(names).")
     }
 
     private func sectionHeader<Trailing: View>(_ title: LocalizedStringKey,
