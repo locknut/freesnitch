@@ -24,6 +24,9 @@ public enum ProfileCommand: Codable, Sendable {
     case refreshBlocklists
     case bindCurrentNetwork(profileName: String)
     case unbindNetwork(gatewayMAC: String)
+    /// Saves the opt-in tunnel profile switch and applies it to the current
+    /// tunnel state at once.
+    case setTunnelProfileSwitch(TunnelProfileSwitch)
 }
 
 /// A complete view of profile state. Every command answers with the same
@@ -43,6 +46,13 @@ public struct ProfileSnapshot: Codable, Sendable {
     public var pendingNetworkSwitch: PendingNetworkSwitch?
     /// Why no gateway MAC is visible, when reading it failed.
     public var gatewayReadProblem: ProfileProblem?
+    /// The opt-in tunnel profile switch. Nil from a helper that predates it.
+    public var tunnelProfileSwitch: TunnelProfileSwitch?
+    /// Whether the tunnel carries traffic right now, as the helper last
+    /// settled it. Nil before the first reading, or from an older helper.
+    public var tunnelConnected: Bool?
+    /// The profile the tunnel switch still owes, when activating it failed.
+    public var pendingTunnelProfile: String?
 
     public init(profiles: [Profile],
                 activeProfile: String,
@@ -55,7 +65,10 @@ public struct ProfileSnapshot: Codable, Sendable {
                 notice: ProfileSwitchNotice?,
                 canUndo: Bool,
                 pendingNetworkSwitch: PendingNetworkSwitch? = nil,
-                gatewayReadProblem: ProfileProblem? = nil) {
+                gatewayReadProblem: ProfileProblem? = nil,
+                tunnelProfileSwitch: TunnelProfileSwitch? = nil,
+                tunnelConnected: Bool? = nil,
+                pendingTunnelProfile: String? = nil) {
         self.profiles = profiles
         self.activeProfile = activeProfile
         self.alwaysRuleCount = alwaysRuleCount
@@ -68,6 +81,9 @@ public struct ProfileSnapshot: Codable, Sendable {
         self.canUndo = canUndo
         self.pendingNetworkSwitch = pendingNetworkSwitch
         self.gatewayReadProblem = gatewayReadProblem
+        self.tunnelProfileSwitch = tunnelProfileSwitch
+        self.tunnelConnected = tunnelConnected
+        self.pendingTunnelProfile = pendingTunnelProfile
     }
 
     /// True when the current network is already bound to the active profile,
@@ -227,6 +243,8 @@ public final class ProfileCommandService: @unchecked Sendable {
             _ = try coordinator.bindCurrentNetwork(toProfile: profileName)
         case .unbindNetwork(let gatewayMAC):
             try coordinator.unbindNetwork(gatewayMAC: gatewayMAC)
+        case .setTunnelProfileSwitch(let setting):
+            try coordinator.setTunnelProfileSwitch(setting)
         }
         return try snapshot()
     }
@@ -248,7 +266,10 @@ public final class ProfileCommandService: @unchecked Sendable {
             notice: notice,
             canUndo: coordinator.canUndo,
             pendingNetworkSwitch: coordinator.pendingNetworkSwitch,
-            gatewayReadProblem: coordinator.gatewayReadProblem
+            gatewayReadProblem: coordinator.gatewayReadProblem,
+            tunnelProfileSwitch: try? coordinator.tunnelSwitchSettings(),
+            tunnelConnected: coordinator.currentTunnelState,
+            pendingTunnelProfile: coordinator.pendingTunnelSwitch?.profile
         )
     }
 

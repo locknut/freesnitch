@@ -30,9 +30,17 @@ public final class IPCConnection: NSObject, @unchecked Sendable {
     private var currentConnection: NSXPCConnection?
     private let connectionLock = NSLock()
     private weak var delegate: AppCommunication?
+    /// Who handed over a snapshot. The extension treats both as the same
+    /// helper-owned policy; the source only decides how a race between them
+    /// is reported (see `FilterDataProvider.receiveSnapshot`).
+    public enum SnapshotSource: Sendable {
+        case app
+        case helper
+    }
+
     /// Extension side: invoked when the app pushes a rule set. It returns the
     /// provider's resulting status synchronously so the app can publish it.
-    public var onSnapshot: ((Data) -> SharedRuleBridge.SnapshotStatus)?
+    public var onSnapshot: ((Data, SnapshotSource) -> SharedRuleBridge.SnapshotStatus)?
     /// Extension side: supplies the current status during registration.
     public var snapshotStatus: (() -> SharedRuleBridge.SnapshotStatus)?
     /// App side: the connection made by `register` was interrupted or
@@ -202,7 +210,8 @@ public final class IPCConnection: NSObject, @unchecked Sendable {
 
 extension IPCConnection: NSXPCListenerDelegate {
     public func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
-        guard XPCPeerValidator.isTrustedGUI(newConnection) else {
+        let fromHelper = XPCPeerValidator.isTrustedHelper(newConnection)
+        guard fromHelper || XPCPeerValidator.isTrustedGUI(newConnection) else {
             PSLog.error(PSLog.netext,
                         "SECURITY: rejected XPC peer failing the FreeSnitch GUI code requirement "
                         + "(pid \(newConnection.processIdentifier)); no snapshot was accepted and "
@@ -222,7 +231,8 @@ extension IPCConnection: NSXPCListenerDelegate {
         }
         // A CLI connection is allowed to inspect and update snapshots, but it
         // must not replace the GUI connection that answers interactive alerts.
-        if !XPCPeerValidator.isCLI(newConnection) {
+        // The helper delivers policy only; it has no alert window either.
+        if !fromHelper && !XPCPeerValidator.isCLI(newConnection) {
             setCurrentConnection(newConnection)
         }
         newConnection.resume()
@@ -275,7 +285,8 @@ extension IPCConnection: ProviderCommunication {
         snapshotJSON: Data,
         completionHandler: @escaping (Data) -> Void
     ) {
-        let status = onSnapshot?(snapshotJSON)
+        let source: SnapshotSource = NSXPCConnection.current().map(XPCPeerValidator.isHelper) == true ? .helper : .app
+        let status = onSnapshot?(snapshotJSON, source)
             ?? .unavailable(String(localized: "Network extension is not ready to receive rule snapshots."))
         completionHandler(Self.encodeStatus(status))
     }

@@ -20,6 +20,23 @@ public enum XPCPeerValidator {
         trustedPeer(connection, requirement: peerRequirement())
     }
 
+    /// The extension also accepts the root helper, so policy reaches it while
+    /// no GUI is running (a tunnel switch, a boot before login). The helper is
+    /// a separate, narrower identity: it may hand over snapshots but never
+    /// becomes the connection that answers interactive alerts. Not added to
+    /// `permittedPeerIdentifiers`, which the helper's own listener also uses.
+    public static func isTrustedHelper(_ connection: NSXPCConnection) -> Bool {
+        trustedPeer(connection, requirement: requirement(for: [AppConstants.bundleIdHelper]))
+            && isHelper(connection)
+    }
+
+    /// True when the peer's signed identifier is the helper's. Ad-hoc builds
+    /// carry their target identifier too, so this holds for them as well.
+    public static func isHelper(_ connection: NSXPCConnection) -> Bool {
+        let id = identifier(of: connection)
+        return id == AppConstants.bundleIdHelper || id == "FreeSnitchHelper"
+    }
+
     /// Used by the extension to keep a CLI inspection connection from taking
     /// ownership of the GUI connection that receives interactive alerts.
     /// Ad-hoc clients cannot become a Developer ID CLI, so this only affects

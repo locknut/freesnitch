@@ -412,6 +412,46 @@ public final class ProfileCoordinator: @unchecked Sendable {
         }
     }
 
+    /// The debounced tunnel state last delivered, nil before the first one.
+    public var currentTunnelState: Bool? {
+        switchSerial.lock()
+        defer { switchSerial.unlock() }
+        return tunnelUp
+    }
+
+    /// Where saving the tunnel setting goes. The store by default; the helper
+    /// replaces it to refuse a change to a value MDM has locked.
+    public var saveTunnelSwitchSettings: ((TunnelProfileSwitch) throws -> Void)?
+
+    /// Saves the tunnel setting and applies it to the tunnel state already
+    /// known, as if that state had just been observed.
+    public func setTunnelProfileSwitch(_ setting: TunnelProfileSwitch) throws {
+        switchSerial.lock()
+        defer { switchSerial.unlock() }
+        if let save = saveTunnelSwitchSettings {
+            try save(setting)
+        } else {
+            try store.setTunnelProfileSwitch(setting)
+        }
+        reapplyTunnelStateLocked()
+    }
+
+    /// Applies the current setting to the known tunnel state again, for when
+    /// the setting changed outside `setTunnelProfileSwitch` (an MDM update).
+    public func reapplyTunnelState() {
+        switchSerial.lock()
+        defer { switchSerial.unlock() }
+        reapplyTunnelStateLocked()
+    }
+
+    private func reapplyTunnelStateLocked() {
+        guard let up = tunnelUp else { return }
+        settledTunnelUp = nil
+        // Treated as a change so an unset side hands back to the gateway.
+        tunnelUp = nil
+        _ = applyObservedTunnelState(up)
+    }
+
     /// The tunnel switch still owed, for status output.
     public var pendingTunnelSwitch: (up: Bool, profile: String)? {
         switchSerial.lock()

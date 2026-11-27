@@ -179,6 +179,16 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     private let profiles: ProfileCommandService
     private let profileCoordinator: ProfileCoordinator
     private let profileQueue = DispatchQueue(label: "io.isaaclins.freesnitch.profiles", qos: .userInitiated)
+    /// Watches whether Cloudflare WARP carries this Mac's traffic. Always
+    /// running, because it only observes; it switches profiles only when the
+    /// opt-in tunnel setting names one for the state it settles.
+    private let tunnelMonitor = TunnelMonitor()
+    /// Retries a tunnel switch that failed, for as long as the tunnel stays in
+    /// the state that asked for it. Guarded by `profileQueue`.
+    private var tunnelRetryTimer: DispatchSourceTimer?
+    /// Delivers policy to the network extension without the app, while a
+    /// helper-driven feature needs it. Set once in `init`.
+    private var extensionPusher: ExtensionPolicyPusher?
     private let dns = DNSProxy()
     private let netmon = NetMonitor()
     private let recentNames = RecentHostNames()
@@ -395,6 +405,20 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
         }
 
         listener.delegate = self
+
+        extensionPusher = ExtensionPolicyPusher(
+            snapshot: { [weak self] in
+                guard let self else { throw CocoaError(.featureUnsupported) }
+                return try SharedRuleBridge.encode(try self.authoritativeSnapshot())
+            },
+            isEnabled: { [weak self] in self?.helperDeliversPolicy() ?? false })
+    }
+
+    /// Whether the helper hands policy to the extension itself. Only while a
+    /// feature that changes policy without the app is turned on, so nothing
+    /// changes for anyone who uses neither.
+    private func helperDeliversPolicy() -> Bool {
+        (try? profileCoordinator.tunnelSwitchSettings())?.isConfigured == true
     }
 
     func start() {
@@ -406,6 +430,36 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
         startBlocklistSchedule()
         // Only a binding the user created can ever switch the active profile.
         profileCoordinator.startWatchingNetworks()
+        tunnelMonitor.onChange = { [weak self] up, reading in
+            guard let self else { return }
+            PSLog.info(PSLog.helper, "\(self.tunnelMonitor.tunnel.displayName) is "
+                       + (up ? "carrying this Mac's traffic" : "not carrying this Mac's traffic (\(reading))"))
+            self.profileQueue.async { self.applyTunnelState(up) }
+        }
+        tunnelMonitor.start()
+        extensionPusher?.start()
+    }
+
+    /// Hands a settled tunnel state to the profile coordinator, retrying a
+    /// failed switch every few seconds until it works or the state changes.
+    /// Runs on `profileQueue`.
+    private func applyTunnelState(_ up: Bool) {
+        tunnelRetryTimer?.cancel()
+        tunnelRetryTimer = nil
+        guard !profileCoordinator.applyObservedTunnelState(up) else { return }
+        let timer = DispatchSource.makeTimerSource(queue: profileQueue)
+        timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            // A newer state already replaced this one: its own call retries.
+            guard self.tunnelMonitor.currentState == up else { return }
+            if self.profileCoordinator.applyObservedTunnelState(up) {
+                self.tunnelRetryTimer?.cancel()
+                self.tunnelRetryTimer = nil
+            }
+        }
+        timer.resume()
+        tunnelRetryTimer = timer
     }
 
     /// Republishes the active profile's policy to the DNS proxy and tells
@@ -447,6 +501,7 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
         broadcast { client in
             client.notifyLog(level: "info", message: AppConstants.profilePolicyChangedLogMessage)
         }
+        extensionPusher?.push()
     }
 
     /// The resolvers that must stay reachable no matter what any feed lists.

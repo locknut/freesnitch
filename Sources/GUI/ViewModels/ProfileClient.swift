@@ -153,6 +153,8 @@ final class ProfileClient: ObservableObject {
             snapshot.selectedBlocklistIDs.remove(id)
         case .bindCurrentNetwork, .unbindNetwork:
             return nil
+        case .setTunnelProfileSwitch(let setting):
+            snapshot.tunnelProfileSwitch = setting
         }
         for index in snapshot.profiles.indices {
             snapshot.profiles[index].isActive = snapshot.profiles[index].name == snapshot.activeProfile
@@ -316,6 +318,10 @@ final class ProfileClient: ObservableObject {
 
     func unbindNetwork(gatewayMAC: String) {
         send(.unbindNetwork(gatewayMAC: gatewayMAC))
+    }
+
+    func setTunnelProfileSwitch(_ setting: TunnelProfileSwitch) {
+        send(.setTunnelProfileSwitch(setting))
     }
 
     func dismissNotice() {

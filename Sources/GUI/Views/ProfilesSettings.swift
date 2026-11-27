@@ -451,6 +451,45 @@ struct ProfilesSettingsView: View {
             .padding(.bottom, 8)
             captionText("FreeSnitch recognises a network by the MAC address of its gateway. It never reads the Wi-Fi name and never asks for Location Services.",
                         tint: .secondary)
+            tunnelRows(profile)
+        }
+    }
+
+    /// The opt-in tunnel switch, shown per profile: whether this profile is
+    /// the one used while Cloudflare WARP carries traffic, or while it does
+    /// not. One profile per side; choosing it here moves it from another.
+    private func tunnelRows(_ profile: Profile) -> some View {
+        let setting = profileClient.snapshot?.tunnelProfileSwitch ?? .off
+        return VStack(alignment: .leading, spacing: 4) {
+            Toggle("Use while Cloudflare WARP is connected", isOn: tunnelBinding(profile, connected: true, setting))
+            Toggle("Use while Cloudflare WARP is not connected", isOn: tunnelBinding(profile, connected: false, setting))
+            Text(tunnelStateLabel).font(.caption).foregroundStyle(.secondary)
+        }
+        .toggleStyle(.checkbox)
+        .controlSize(.small)
+        .disabled(!profileClient.isAvailable || profileClient.snapshot?.tunnelProfileSwitch == nil)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
+    }
+
+    private func tunnelBinding(_ profile: Profile, connected: Bool, _ setting: TunnelProfileSwitch) -> Binding<Bool> {
+        Binding(
+            get: { setting.target(tunnelUp: connected) == profile.name },
+            set: { isOn in
+                var next = setting
+                let name: String? = isOn ? profile.name : nil
+                if connected { next.connectedProfile = name } else { next.disconnectedProfile = name }
+                next.enabled = next.connectedProfile != nil || next.disconnectedProfile != nil
+                profileClient.setTunnelProfileSwitch(next)
+            }
+        )
+    }
+
+    private var tunnelStateLabel: String {
+        switch profileClient.snapshot?.tunnelConnected {
+        case true?: return String(localized: "Cloudflare WARP is carrying this Mac's traffic.")
+        case false?: return String(localized: "Cloudflare WARP is not carrying this Mac's traffic.")
+        case nil: return String(localized: "FreeSnitch has not read the tunnel state yet.")
         }
     }
 
