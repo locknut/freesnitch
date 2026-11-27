@@ -19,6 +19,8 @@ grep -Fq 'self?.managed.tunnelTriggers != nil ? "VPN triggers are set by MDM" : 
   || fail "the helper lets the app change managed VPN triggers"
 grep -Fq 'if let managed = self?.managed.tunnelTriggers { return managed }' "$HELPER" \
   || fail "managed VPN triggers no longer take precedence over the stored ones"
+start_body="$(awk '/^    func start\(\) \{/{f=1} f{print} f&&/^    }$/{exit}' "$HELPER")"
+grep -Fq 'managedWatcher.start()' <<<"$start_body" || fail "the helper never starts watching managed preferences"
 pass "the helper gives managed values precedence and refuses changes to them"
 
 cat > "$TMP/main.swift" <<'SWIFT'

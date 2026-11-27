@@ -510,6 +510,8 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
                 self.applyTunnelState(state.connected)
             }
         }
+        // Managed settings first, so the first VPN state is judged by them.
+        managedWatcher.start()
         tunnelMonitor.start()
         extensionPusher?.start()
     }
