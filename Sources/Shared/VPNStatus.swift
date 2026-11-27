@@ -57,9 +57,12 @@ public enum VPNStatus {
     /// `State:/Network/Global/DNS`. Pure, so it is tested with the store
     /// contents of real VPNs.
     ///
-    /// A service counts as a connected VPN when it has a `VPN` entry and an
-    /// IPv4 or IPv6 entry naming its interface: macOS writes the address
-    /// entries only while the tunnel is up. The VPN takes all lookups when the
+    /// A service counts as a connected VPN when it has a `VPN` entry, or is
+    /// a tunnel service as `TunnelStatus` defines it (a tunnel interface with
+    /// a routable address), and an IPv4 or IPv6 entry naming its interface:
+    /// macOS writes the address entries only while the tunnel is up. This is
+    /// about DNS and the Settings banner; it does not ask whether the VPN
+    /// carries all traffic, which is what VPN triggers use. The VPN takes all lookups when the
     /// global DNS configuration came from it, or when its servers are the
     /// global servers.
     public static func connectedVPNs(in store: [String: Any]) -> [ActiveVPN] {
