@@ -10,19 +10,19 @@ import Foundation
 ///    flows, and none may be added: `handleNewFlow` in the network extension is
 ///    the only consumer of a policy change.
 /// 2. Automatic switching happens only for a binding the user created with
-///    `bindCurrentNetwork(toProfile:)`, or for the opt-in tunnel setting
-///    (`TunnelProfileSwitch`). An unknown gateway leaves the active profile
-///    exactly where it is.
+///    `bindCurrentNetwork(toProfile:)`, or for a VPN trigger the user created
+///    (`TunnelTrigger`). An unknown gateway leaves the active profile exactly
+///    where it is.
 ///
-/// While the tunnel setting names a profile for the current tunnel state, it
-/// takes precedence over gateway bindings: being inside the organisation's
-/// tunnel says more about where traffic goes than which router is nearby.
+/// While a VPN trigger matches, it takes precedence over gateway bindings:
+/// whether traffic goes through a tunnel says more about where it goes than
+/// which router is nearby.
 public final class ProfileCoordinator: @unchecked Sendable {
     public enum SwitchReason: String, Sendable {
         case user
         case network
         case undo
-        /// A full tunnel (Cloudflare WARP) came up or went down.
+        /// A VPN trigger matched (a tunnel came up or went down).
         case tunnel
     }
 
@@ -61,18 +61,17 @@ public final class ProfileCoordinator: @unchecked Sendable {
     /// that has already read its binding can't land after a pick the user
     /// made meanwhile. Recursive because a network switch calls `activate`.
     private let switchSerial = NSRecursiveLock()
-    /// The debounced tunnel state last delivered, nil before the first one.
-    /// Only read and written while `switchSerial` is held.
-    private var tunnelUp: Bool?
-    /// The tunnel state whose switch is settled: applied, not needed, or
-    /// decided by the user picking a profile while in it. Mirrors
-    /// `settledGatewayMAC`.
-    private var settledTunnelUp: Bool?
-    /// The tunnel switch still owed because activating its profile failed.
-    private var pendingTunnel: (up: Bool, profile: String)?
-    /// Where the tunnel setting is read from. The store by default; the
-    /// helper replaces it when an MDM-managed value takes precedence.
-    public var tunnelSwitchSettings: () throws -> TunnelProfileSwitch
+    /// The settled set of connected VPN services last delivered, nil before
+    /// the first one. Only read and written while `switchSerial` is held.
+    private var tunnelConnected: Set<String>?
+    /// The winning trigger whose switch is settled (applied, or overridden
+    /// by the user while it won), "" for none. Mirrors `settledGatewayMAC`.
+    private var settledTriggerKey: String?
+    /// The trigger whose switch is still owed because activating failed.
+    private var pendingTunnel: TunnelTrigger?
+    /// Where the triggers are read from. The store by default; the helper
+    /// replaces it when MDM manages them.
+    public var tunnelTriggers: () throws -> [TunnelTrigger]
     /// Runs inside a network switch, after its binding was read and before it
     /// is applied. Only the profiles harness sets it, to replay a manual pick
     /// arriving at exactly that moment.
@@ -81,7 +80,7 @@ public final class ProfileCoordinator: @unchecked Sendable {
     public init(store: RuleStore, watcher: GatewayMACWatcher = GatewayMACWatcher()) {
         self.store = store
         self.watcher = watcher
-        self.tunnelSwitchSettings = { try store.tunnelProfileSwitch() }
+        self.tunnelTriggers = { try store.tunnelTriggers() }
     }
 
     /// Wiring point for the helper and the GUI: called after the active policy
@@ -214,9 +213,9 @@ public final class ProfileCoordinator: @unchecked Sendable {
             let current = lastObservedGatewayMAC ?? ""
             lock.unlock()
             settledGatewayMAC = current
-            // The same for the tunnel: the user's pick holds until the tunnel
-            // really changes state.
-            settledTunnelUp = tunnelUp
+            // The same for VPN triggers: the user's pick holds until another
+            // trigger wins.
+            settledTriggerKey = winningTriggerKey()
             pendingTunnel = nil
         }
         if reason != .network, let pendingSwitch = pendingNetworkSwitch {
@@ -344,44 +343,55 @@ public final class ProfileCoordinator: @unchecked Sendable {
         }
     }
 
-    // MARK: - tunnel
+    // MARK: - VPN triggers
 
-    /// Whether the tunnel setting names a profile for the tunnel state last
-    /// delivered. Callers hold `switchSerial`. An unreadable setting owns
-    /// nothing, so gateway bindings keep working.
-    private func tunnelOwnsActiveProfile() -> Bool {
-        guard let tunnelUp, let setting = try? tunnelSwitchSettings() else { return false }
-        return setting.target(tunnelUp: tunnelUp) != nil
+    /// The trigger that decides the profile for the VPN state last delivered,
+    /// as a key that also changes when its profile does. Nil before the
+    /// first state. Callers hold `switchSerial`. An unreadable trigger list
+    /// decides nothing, so gateway bindings keep working.
+    private func winningTriggerKey() -> String? {
+        guard let tunnelConnected else { return nil }
+        guard let triggers = try? tunnelTriggers() else { return "" }
+        return TunnelTrigger.winner(triggers, connected: tunnelConnected).map { "\($0.id)>\($0.profile)" } ?? ""
     }
 
-    /// The monitor's entry point, called with each debounced tunnel state.
-    /// Returns false when the switch it asked for failed; the caller retries
-    /// with the same state until it returns true or the state changes.
+    private func tunnelOwnsActiveProfile() -> Bool {
+        guard let key = winningTriggerKey() else { return false }
+        return !key.isEmpty
+    }
+
+    /// The monitor's entry point, called with each settled set of connected
+    /// VPN services. Returns false when the switch it asked for failed; the
+    /// caller retries with the same state until it returns true or the state
+    /// changes.
     ///
-    /// With the setting off, or with no profile named for this state, the
-    /// gateway bindings decide, as they would without a tunnel at all.
+    /// The winning trigger (see `TunnelTrigger.winner`) decides the profile.
+    /// With no trigger matching, gateway bindings decide, as they would
+    /// without any VPN. A profile the user picked holds until a different
+    /// trigger wins.
     @discardableResult
-    public func applyObservedTunnelState(_ up: Bool) -> Bool {
+    public func applyObservedTunnelState(_ connected: Set<String>) -> Bool {
         switchSerial.lock()
         defer { switchSerial.unlock() }
-        let changed = tunnelUp != up
-        tunnelUp = up
-        if changed { settledTunnelUp = nil }
-        if settledTunnelUp == up { return true }
-        let setting: TunnelProfileSwitch
+        tunnelConnected = connected
+        let triggers: [TunnelTrigger]
         do {
-            setting = try tunnelSwitchSettings()
+            triggers = try tunnelTriggers()
         } catch {
-            PSLog.error(PSLog.helper, "The tunnel profile setting could not be read: \(error.localizedDescription). "
-                        + "Network bindings decide the profile until it can be read.")
+            PSLog.error(PSLog.helper, "The VPN triggers could not be read: \(error.localizedDescription). "
+                        + "Network bindings decide the profile until they can be read.")
             return true
         }
-        guard let target = setting.target(tunnelUp: up) else {
-            settledTunnelUp = up
+        let winner = TunnelTrigger.winner(triggers, connected: connected)
+        let key = winner.map { "\($0.id)>\($0.profile)" } ?? ""
+        if settledTriggerKey == key { return true }
+        guard let winner else {
+            // No trigger matches any more: the gateway decides again, as if
+            // the gateway seen last had just been seen.
+            let triggerHeldIt = !(settledTriggerKey ?? "").isEmpty
+            settledTriggerKey = ""
             pendingTunnel = nil
-            // Nothing is asked for this state, so the gateway decides again:
-            // the gateway seen last is applied as if it had just been seen.
-            if changed, setting.enabled {
+            if triggerHeldIt {
                 settledGatewayMAC = nil
                 lock.lock()
                 let mac = lastObservedGatewayMAC
@@ -393,59 +403,70 @@ public final class ProfileCoordinator: @unchecked Sendable {
             return true
         }
         do {
-            if target != store.activeProfileName() {
-                let result = try activate(profileName: target, reason: .tunnel)
+            if winner.profile != store.activeProfileName() {
+                let result = try activate(profileName: winner.profile, reason: .tunnel)
+                let vpn = winner.service ?? "any VPN"
                 PSLog.notice(PSLog.helper, "The profile \(result.notice.activeProfile) is now active because "
-                             + "\(TunnelDefinition.cloudflareWARP.displayName) is \(up ? "connected" : "not connected").")
+                             + "\(vpn) is \(winner.whenConnected ? "connected" : "not connected").")
             }
-            settledTunnelUp = up
+            settledTriggerKey = key
             pendingTunnel = nil
-            // A gateway settled while the tunnel owned the profile is decided
-            // again once the tunnel lets go of it.
+            // A gateway settled while a trigger held the profile is decided
+            // again once no trigger does.
             settledGatewayMAC = nil
             return true
         } catch {
-            let first = pendingTunnel.map { $0.up != up || $0.profile != target } ?? true
-            pendingTunnel = (up, target)
+            let first = pendingTunnel != winner
+            pendingTunnel = winner
             if first {
-                PSLog.error(PSLog.helper, "Could not switch to the profile \(target) for the tunnel state "
-                            + "(\(up ? "connected" : "not connected")): \(error.localizedDescription). Retrying until it works.")
+                PSLog.error(PSLog.helper, "Could not switch to the profile \(winner.profile) for a VPN trigger: "
+                            + "\(error.localizedDescription). Retrying until it works.")
             }
             return false
         }
     }
 
-    /// The debounced tunnel state last delivered, nil before the first one.
-    public var currentTunnelState: Bool? {
+    /// The trigger whose switch is still owed, for status output.
+    public var pendingTunnelSwitch: TunnelTrigger? {
         switchSerial.lock()
         defer { switchSerial.unlock() }
-        return tunnelUp
+        return pendingTunnel
+    }
+
+    /// The settled set of connected VPN services, nil before the first one.
+    public var currentTunnelConnected: Set<String>? {
+        switchSerial.lock()
+        defer { switchSerial.unlock() }
+        return tunnelConnected
     }
 
     /// Consulted before a switch the user asked for (a pick or an undo).
     /// Returns why it is refused, or nil to allow it. The helper sets it when
-    /// MDM locks the profile the tunnel switch chose.
+    /// MDM locks the profile a managed trigger chose.
     public var userSwitchRefusal: (() -> String?)?
 
-    /// Where saving the tunnel setting goes. The store by default; the helper
-    /// replaces it to refuse a change to a value MDM has locked.
-    public var saveTunnelSwitchSettings: ((TunnelProfileSwitch) throws -> Void)?
+    /// Consulted before the user adds or removes a trigger. The helper sets
+    /// it when MDM manages the triggers.
+    public var triggerEditRefusal: (() -> String?)?
 
-    /// Saves the tunnel setting and applies it to the tunnel state already
-    /// known, as if that state had just been observed.
-    public func setTunnelProfileSwitch(_ setting: TunnelProfileSwitch) throws {
+    public func setTunnelTrigger(_ trigger: TunnelTrigger) throws {
         switchSerial.lock()
         defer { switchSerial.unlock() }
-        if let save = saveTunnelSwitchSettings {
-            try save(setting)
-        } else {
-            try store.setTunnelProfileSwitch(setting)
-        }
+        if let refusal = triggerEditRefusal?() { throw ProfileValidationError.managedByOrganization(refusal) }
+        _ = try store.setTunnelTrigger(trigger)
         reapplyTunnelStateLocked()
     }
 
-    /// Applies the current setting to the known tunnel state again, for when
-    /// the setting changed outside `setTunnelProfileSwitch` (an MDM update).
+    public func removeTunnelTrigger(id: String) throws {
+        switchSerial.lock()
+        defer { switchSerial.unlock() }
+        if let refusal = triggerEditRefusal?() { throw ProfileValidationError.managedByOrganization(refusal) }
+        _ = try store.removeTunnelTrigger(id: id)
+        reapplyTunnelStateLocked()
+    }
+
+    /// Applies the triggers to the known VPN state again, for when they
+    /// changed outside this coordinator (an MDM update).
     public func reapplyTunnelState() {
         switchSerial.lock()
         defer { switchSerial.unlock() }
@@ -453,18 +474,11 @@ public final class ProfileCoordinator: @unchecked Sendable {
     }
 
     private func reapplyTunnelStateLocked() {
-        guard let up = tunnelUp else { return }
-        settledTunnelUp = nil
-        // Treated as a change so an unset side hands back to the gateway.
-        tunnelUp = nil
-        _ = applyObservedTunnelState(up)
-    }
-
-    /// The tunnel switch still owed, for status output.
-    public var pendingTunnelSwitch: (up: Bool, profile: String)? {
-        switchSerial.lock()
-        defer { switchSerial.unlock() }
-        return pendingTunnel
+        guard let connected = tunnelConnected else { return }
+        // Keep "a trigger held the profile" so a removed trigger hands back
+        // to the gateway, but force the winner to be applied again.
+        if let key = settledTriggerKey, !key.isEmpty { settledTriggerKey = "\u{0}" } else { settledTriggerKey = nil }
+        _ = applyObservedTunnelState(connected)
     }
 
     private func setPending(_ value: PendingNetworkSwitch?) {

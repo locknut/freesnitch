@@ -24,9 +24,10 @@ public enum ProfileCommand: Codable, Sendable {
     case refreshBlocklists
     case bindCurrentNetwork(profileName: String)
     case unbindNetwork(gatewayMAC: String)
-    /// Saves the opt-in tunnel profile switch and applies it to the current
-    /// tunnel state at once.
-    case setTunnelProfileSwitch(TunnelProfileSwitch)
+    /// Adds a VPN trigger (replacing one with the same condition) and applies
+    /// the triggers to the current VPN state at once.
+    case setTunnelTrigger(TunnelTrigger)
+    case removeTunnelTrigger(id: String)
 }
 
 /// A complete view of profile state. Every command answers with the same
@@ -46,15 +47,17 @@ public struct ProfileSnapshot: Codable, Sendable {
     public var pendingNetworkSwitch: PendingNetworkSwitch?
     /// Why no gateway MAC is visible, when reading it failed.
     public var gatewayReadProblem: ProfileProblem?
-    /// The opt-in tunnel profile switch. Nil from a helper that predates it.
-    public var tunnelProfileSwitch: TunnelProfileSwitch?
-    /// Whether the tunnel carries traffic right now, as the helper last
-    /// settled it. Nil before the first reading, or from an older helper.
-    public var tunnelConnected: Bool?
-    /// The profile the tunnel switch still owes, when activating it failed.
+    /// The VPN triggers. Nil from a helper that predates them.
+    public var tunnelTriggers: [TunnelTrigger]?
+    /// The VPN services present on this Mac, for choosing one in a trigger.
+    public var tunnelServices: [TunnelService]?
+    /// The services that own the default route, as the helper last settled
+    /// it. Nil before the first reading, or from an older helper.
+    public var tunnelConnected: [String]?
+    /// The profile a VPN trigger still owes, when activating it failed.
     public var pendingTunnelProfile: String?
-    /// True when MDM sets the tunnel switch, so the app shows it read-only.
-    public var tunnelProfileSwitchManaged: Bool?
+    /// True when MDM sets the triggers, so the app shows them read-only.
+    public var tunnelTriggersManaged: Bool?
 
     public init(profiles: [Profile],
                 activeProfile: String,
@@ -68,10 +71,11 @@ public struct ProfileSnapshot: Codable, Sendable {
                 canUndo: Bool,
                 pendingNetworkSwitch: PendingNetworkSwitch? = nil,
                 gatewayReadProblem: ProfileProblem? = nil,
-                tunnelProfileSwitch: TunnelProfileSwitch? = nil,
-                tunnelConnected: Bool? = nil,
+                tunnelTriggers: [TunnelTrigger]? = nil,
+                tunnelServices: [TunnelService]? = nil,
+                tunnelConnected: [String]? = nil,
                 pendingTunnelProfile: String? = nil,
-                tunnelProfileSwitchManaged: Bool? = nil) {
+                tunnelTriggersManaged: Bool? = nil) {
         self.profiles = profiles
         self.activeProfile = activeProfile
         self.alwaysRuleCount = alwaysRuleCount
@@ -84,10 +88,11 @@ public struct ProfileSnapshot: Codable, Sendable {
         self.canUndo = canUndo
         self.pendingNetworkSwitch = pendingNetworkSwitch
         self.gatewayReadProblem = gatewayReadProblem
-        self.tunnelProfileSwitch = tunnelProfileSwitch
+        self.tunnelTriggers = tunnelTriggers
+        self.tunnelServices = tunnelServices
         self.tunnelConnected = tunnelConnected
         self.pendingTunnelProfile = pendingTunnelProfile
-        self.tunnelProfileSwitchManaged = tunnelProfileSwitchManaged
+        self.tunnelTriggersManaged = tunnelTriggersManaged
     }
 
     /// True when the current network is already bound to the active profile,
@@ -172,8 +177,10 @@ public final class ProfileCommandService: @unchecked Sendable {
     /// authoritative snapshot. It affects new flows only; nothing here touches
     /// an established connection.
     public var onPolicyChanged: ((ProfilePolicy) -> Void)?
-    /// Whether MDM sets the tunnel switch; reported in every snapshot.
-    public var tunnelSwitchManaged: (() -> Bool)?
+    /// Whether MDM sets the VPN triggers; reported in every snapshot.
+    public var tunnelTriggersManaged: (() -> Bool)?
+    /// The VPN services the helper sees; reported in every snapshot.
+    public var tunnelServices: (() -> [TunnelService])?
 
     public init(store: RuleStore, coordinator: ProfileCoordinator) {
         self.store = store
@@ -249,8 +256,10 @@ public final class ProfileCommandService: @unchecked Sendable {
             _ = try coordinator.bindCurrentNetwork(toProfile: profileName)
         case .unbindNetwork(let gatewayMAC):
             try coordinator.unbindNetwork(gatewayMAC: gatewayMAC)
-        case .setTunnelProfileSwitch(let setting):
-            try coordinator.setTunnelProfileSwitch(setting)
+        case .setTunnelTrigger(let trigger):
+            try coordinator.setTunnelTrigger(trigger)
+        case .removeTunnelTrigger(let id):
+            try coordinator.removeTunnelTrigger(id: id)
         }
         return try snapshot()
     }
@@ -273,10 +282,11 @@ public final class ProfileCommandService: @unchecked Sendable {
             canUndo: coordinator.canUndo,
             pendingNetworkSwitch: coordinator.pendingNetworkSwitch,
             gatewayReadProblem: coordinator.gatewayReadProblem,
-            tunnelProfileSwitch: try? coordinator.tunnelSwitchSettings(),
-            tunnelConnected: coordinator.currentTunnelState,
+            tunnelTriggers: try? coordinator.tunnelTriggers(),
+            tunnelServices: tunnelServices?() ?? [],
+            tunnelConnected: coordinator.currentTunnelConnected.map { $0.sorted() },
             pendingTunnelProfile: coordinator.pendingTunnelSwitch?.profile,
-            tunnelProfileSwitchManaged: tunnelSwitchManaged?() ?? false
+            tunnelTriggersManaged: tunnelTriggersManaged?() ?? false
         )
     }
 

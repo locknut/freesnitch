@@ -153,8 +153,12 @@ final class ProfileClient: ObservableObject {
             snapshot.selectedBlocklistIDs.remove(id)
         case .bindCurrentNetwork, .unbindNetwork:
             return nil
-        case .setTunnelProfileSwitch(let setting):
-            snapshot.tunnelProfileSwitch = setting
+        case .setTunnelTrigger(let trigger):
+            var triggers = (snapshot.tunnelTriggers ?? []).filter { $0.id != trigger.id }
+            triggers.append(trigger)
+            snapshot.tunnelTriggers = triggers
+        case .removeTunnelTrigger(let id):
+            snapshot.tunnelTriggers = (snapshot.tunnelTriggers ?? []).filter { $0.id != id }
         }
         for index in snapshot.profiles.indices {
             snapshot.profiles[index].isActive = snapshot.profiles[index].name == snapshot.activeProfile
@@ -320,8 +324,12 @@ final class ProfileClient: ObservableObject {
         send(.unbindNetwork(gatewayMAC: gatewayMAC))
     }
 
-    func setTunnelProfileSwitch(_ setting: TunnelProfileSwitch) {
-        send(.setTunnelProfileSwitch(setting))
+    func setTunnelTrigger(_ trigger: TunnelTrigger) {
+        send(.setTunnelTrigger(trigger))
+    }
+
+    func removeTunnelTrigger(id: String) {
+        send(.removeTunnelTrigger(id: id))
     }
 
     func dismissNotice() {

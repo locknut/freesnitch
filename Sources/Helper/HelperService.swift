@@ -179,11 +179,11 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     private let profiles: ProfileCommandService
     private let profileCoordinator: ProfileCoordinator
     private let profileQueue = DispatchQueue(label: "io.isaaclins.freesnitch.profiles", qos: .userInitiated)
-    /// Watches whether Cloudflare WARP carries this Mac's traffic. Always
-    /// running, because it only observes; it switches profiles only when the
-    /// opt-in tunnel setting names one for the state it settles.
+    /// Watches which VPN services own the default route. Always running,
+    /// because it only observes; it switches profiles only when a VPN
+    /// trigger the user or MDM created matches the state it settles.
     private let tunnelMonitor = TunnelMonitor()
-    /// Retries a tunnel switch that failed, for as long as the tunnel stays in
+    /// Retries a VPN trigger switch that failed, for as long as the VPN stays in
     /// the state that asked for it. Guarded by `profileQueue`.
     private var tunnelRetryTimer: DispatchSourceTimer?
     /// Delivers policy to the network extension without the app, while a
@@ -422,38 +422,36 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
             },
             isEnabled: { [weak self] in self?.helperDeliversPolicy() ?? false })
 
-        // A managed tunnel switch replaces the stored one, and cannot be
-        // changed from the app while it is managed.
+        // Managed VPN triggers replace the stored ones, and cannot be changed
+        // from the app while they are managed.
         let storeRef = store
-        profileCoordinator.tunnelSwitchSettings = { [weak self] in
-            if let managed = self?.managed.tunnelProfileSwitch { return managed }
-            return try storeRef.tunnelProfileSwitch()
+        profileCoordinator.tunnelTriggers = { [weak self] in
+            if let managed = self?.managed.tunnelTriggers { return managed }
+            return try storeRef.tunnelTriggers()
         }
-        profileCoordinator.saveTunnelSwitchSettings = { [weak self] setting in
-            if self?.managed.tunnelProfileSwitch != nil {
-                throw ProfileValidationError.managedByOrganization("the tunnel profile switch is set by MDM")
-            }
-            try storeRef.setTunnelProfileSwitch(setting)
+        profileCoordinator.triggerEditRefusal = { [weak self] in
+            self?.managed.tunnelTriggers != nil ? "VPN triggers are set by MDM" : nil
         }
-        // With LockSettings, a profile the managed tunnel switch chose stays
-        // until the tunnel changes; the user cannot pick another.
+        // With LockSettings, a profile a managed trigger chose stays until
+        // another trigger wins; the user cannot pick another.
         profileCoordinator.userSwitchRefusal = { [weak self] in
             guard let self else { return nil }
             let managed = self.managed
-            guard managed.lockSettings, let tunnel = managed.tunnelProfileSwitch,
-                  let up = self.profileCoordinator.currentTunnelState,
-                  tunnel.target(tunnelUp: up) != nil else { return nil }
-            return "the profile follows Cloudflare WARP's state"
+            guard managed.lockSettings, let triggers = managed.tunnelTriggers,
+                  let connected = self.profileCoordinator.currentTunnelConnected,
+                  TunnelTrigger.winner(triggers, connected: connected) != nil else { return nil }
+            return "the profile follows a VPN trigger set by MDM"
         }
-        profiles.tunnelSwitchManaged = { [weak self] in self?.managed.tunnelProfileSwitch != nil }
+        profiles.tunnelTriggersManaged = { [weak self] in self?.managed.tunnelTriggers != nil }
+        profiles.tunnelServices = { [weak self] in self?.tunnelMonitor.currentState?.services ?? [] }
         managedWatcher.onChange = { [weak self] prefs in
             self?.profileQueue.async { self?.applyManaged(prefs) }
         }
     }
 
     /// Applies a new version of the managed preferences: profiles, bindings
-    /// and rules into the store, then the tunnel switch against the current
-    /// tunnel state, then the policy republished. Runs on `profileQueue`.
+    /// and rules into the store, then the VPN triggers against the current
+    /// VPN state, then the policy republished. Runs on `profileQueue`.
     private func applyManaged(_ prefs: ManagedPreferences) {
         managedLock.lock()
         managedStorage = prefs
@@ -479,7 +477,7 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     /// feature that changes policy without the app is turned on, so nothing
     /// changes for anyone who uses neither.
     private func helperDeliversPolicy() -> Bool {
-        managed.helperDeliversPolicy || (try? profileCoordinator.tunnelSwitchSettings())?.isConfigured == true
+        managed.helperDeliversPolicy || ((try? profileCoordinator.tunnelTriggers())?.isEmpty == false)
     }
 
     func start() {
@@ -491,13 +489,12 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
         startBlocklistSchedule()
         // Only a binding the user created can ever switch the active profile.
         profileCoordinator.startWatchingNetworks()
-        tunnelMonitor.onChange = { [weak self] up, reading in
+        tunnelMonitor.onChange = { [weak self] state in
             guard let self else { return }
-            PSLog.info(PSLog.helper, "\(self.tunnelMonitor.tunnel.displayName) is "
-                       + (up ? "carrying this Mac's traffic" : "not carrying this Mac's traffic (\(reading))"))
-            self.profileQueue.async { self.applyTunnelState(up) }
+            PSLog.info(PSLog.helper, state.connected.isEmpty ? "No VPN owns the default route."
+                       : "VPN services owning the default route: \(state.connected.sorted().joined(separator: ", ")).")
+            self.profileQueue.async { self.applyTunnelState(state.connected) }
         }
-        managedWatcher.start()
         tunnelMonitor.start()
         extensionPusher?.start()
     }
@@ -505,17 +502,17 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
     /// Hands a settled tunnel state to the profile coordinator, retrying a
     /// failed switch every few seconds until it works or the state changes.
     /// Runs on `profileQueue`.
-    private func applyTunnelState(_ up: Bool) {
+    private func applyTunnelState(_ connected: Set<String>) {
         tunnelRetryTimer?.cancel()
         tunnelRetryTimer = nil
-        guard !profileCoordinator.applyObservedTunnelState(up) else { return }
+        guard !profileCoordinator.applyObservedTunnelState(connected) else { return }
         let timer = DispatchSource.makeTimerSource(queue: profileQueue)
         timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .seconds(1))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             // A newer state already replaced this one: its own call retries.
-            guard self.tunnelMonitor.currentState == up else { return }
-            if self.profileCoordinator.applyObservedTunnelState(up) {
+            guard self.tunnelMonitor.currentState?.connected == connected else { return }
+            if self.profileCoordinator.applyObservedTunnelState(connected) {
                 self.tunnelRetryTimer?.cancel()
                 self.tunnelRetryTimer = nil
             }

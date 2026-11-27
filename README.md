@@ -164,6 +164,8 @@ Rules layer exactly twice: the `Always` set plus the active profile's own rules.
 
 A network is recognised by the MAC address of its default gateway. FreeSnitch never reads the Wi-Fi network name and never asks for Location Services. A network only ever selects a profile after you bind it with "use this here"; an unknown network changes nothing.
 
+A profile can also follow a VPN: "Activate when *any VPN* (or one VPN service) is *connected* (or *not connected*)". A VPN counts as connected while it carries the Mac's default traffic, which the helper reads from the routing table rather than from the VPN app, so it also works with the app closed. A split-tunnel VPN, which routes only some networks, never counts as connected. While a VPN trigger matches, it takes precedence over network bindings; when none matches, network bindings decide as before. See [docs/vpn-triggers-and-managed-settings.md](docs/vpn-triggers-and-managed-settings.md), which also covers MDM-managed settings and the opt-in fail-closed mode.
+
 Switching profiles affects new connections only. Verdicts are made in `handleNewFlow`, so replacing the active rule set cannot retroactively drop an established session such as SSH. Every switch is announced with the active and paused rule counts and an Undo, and the active profile is always visible in the menu bar.
 
 ### Menubar Status Item

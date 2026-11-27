@@ -68,14 +68,10 @@ public enum VPNStatus {
         let globalSource = (globalDNS?["__CONFIGURATION_ID__"] as? String) ?? ""
 
         var result: [ActiveVPN] = []
-        // Cloudflare WARP publishes its own service with address and DNS
-        // entries but no VPN entry, so it is looked for by its service id.
-        var serviceIDs = store.keys.compactMap { serviceID(of: $0, suffix: "/VPN") }
-        let warp = TunnelDefinition.cloudflareWARP.serviceID
-        if !serviceIDs.contains(warp),
-           store.keys.contains(where: { $0.hasPrefix("State:/Network/Service/\(warp)/") }) {
-            serviceIDs.append(warp)
-        }
+        // Some VPN clients publish a service with a tunnel interface but no
+        // VPN entry; those count as VPNs too (see TunnelStatus).
+        let serviceIDs = Set(store.keys.compactMap { serviceID(of: $0, suffix: "/VPN") })
+            .union(TunnelStatus.tunnelServices(in: store).map(\.service.id))
         for serviceID in serviceIDs.sorted() {
             let base = "State:/Network/Service/\(serviceID)"
             let interface = interfaceName(store["\(base)/IPv4"]) ?? interfaceName(store["\(base)/IPv6"])
@@ -95,8 +91,10 @@ public enum VPNStatus {
             // resolver the user set anyway.
             let sameServers = (match.isEmpty || claimsDefault) && !servers.isEmpty && !globalServers.isEmpty
                 && globalServers.isSubset(of: Set(servers))
+            // A service with no user-defined name is named by its id, which
+            // such clients choose to be readable.
             let name = (setup?["UserDefinedName"] as? String)
-                ?? (serviceID == warp ? TunnelDefinition.cloudflareWARP.displayName : nil)
+                ?? (store["\(base)/VPN"] == nil ? serviceID : nil)
             result.append(ActiveVPN(name: name,
                                     interface: interface,
                                     dnsServers: servers,
@@ -145,11 +143,7 @@ public enum VPNStatus {
         if let owner = dnsOwner(vpns), !routesThroughProxy {
             let servers = owner.dnsServers.joined(separator: ", ")
             var text = String(localized: "\(owner.displayName) is handling DNS right now (\(servers)), so FreeSnitch's DNS blocking and upstream don't apply while it is connected.")
-            if isCloudflareWARP(owner) {
-                // WARP's DNS is usually the organisation's filtering (Gateway),
-                // so advising the user to turn it off would be wrong.
-                text += " " + String(localized: "Cloudflare WARP sends lookups to your organization's resolver, which applies its own DNS filtering. FreeSnitch's per-app rules still apply to every connection.")
-            } else if isTailscale(owner) {
+            if isTailscale(owner) {
                 text += " " + String(localized: "To use FreeSnitch's DNS while it is connected, turn off Use Tailscale DNS Settings in the Tailscale menu, then set this Mac's DNS server to 127.0.0.1 if it isn't already.")
             } else {
                 text += " " + String(localized: "To use FreeSnitch's DNS while it is connected, turn off the VPN's own DNS in its settings, if it has that option, then set this Mac's DNS server to 127.0.0.1 if it isn't already.")
@@ -166,12 +160,6 @@ public enum VPNStatus {
             }
             return String(localized: "Lookups for \(domains) go to \(vpn.displayName), so FreeSnitch's DNS blocking doesn't apply to those names.")
         }.joined(separator: " ")
-    }
-
-    /// WARP has no VPN entry and no user-defined name; it is found by its
-    /// service id and named after it.
-    public static func isCloudflareWARP(_ vpn: ActiveVPN) -> Bool {
-        vpn.name == TunnelDefinition.cloudflareWARP.displayName
     }
 
     /// Tailscale names its service "Tailscale" and serves MagicDNS from

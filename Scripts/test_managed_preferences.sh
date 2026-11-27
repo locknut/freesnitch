@@ -15,10 +15,10 @@ pass() { printf 'managed preferences verification: PASS: %s\n' "$*"; }
 
 grep -Fq 'if ManagedPolicySync.managedRuleIDs(in: store).contains(id) {' "$HELPER" \
   || fail "the helper lets the app delete a rule MDM set"
-grep -Fq 'throw ProfileValidationError.managedByOrganization("the tunnel profile switch is set by MDM")' "$HELPER" \
-  || fail "the helper lets the app change a managed tunnel switch"
-grep -Fq 'if let managed = self?.managed.tunnelProfileSwitch { return managed }' "$HELPER" \
-  || fail "a managed tunnel switch no longer takes precedence over the stored one"
+grep -Fq 'self?.managed.tunnelTriggers != nil ? "VPN triggers are set by MDM" : nil' "$HELPER" \
+  || fail "the helper lets the app change managed VPN triggers"
+grep -Fq 'if let managed = self?.managed.tunnelTriggers { return managed }' "$HELPER" \
+  || fail "managed VPN triggers no longer take precedence over the stored ones"
 pass "the helper gives managed values precedence and refuses changes to them"
 
 cat > "$TMP/main.swift" <<'SWIFT'
@@ -42,7 +42,7 @@ check("an unreadable file throws instead of looking unmanaged", (try? ManagedPre
 let full: [String: Any] = [
     "LockSettings": true,
     "HelperDeliversPolicy": true,
-    "TunnelProfileSwitch": ["Enabled": true, "ConnectedProfile": "Work", "DisconnectedProfile": "Restricted"],
+    "VPNTriggers": [["Profile": "Work", "When": "connected"], ["Profile": "Restricted", "When": "disconnected"]],
     "Profiles": [["Name": "Work", "Mode": "silentAllow"], ["Name": "Restricted", "Mode": "silentDeny"]],
     "Rules": [
         ["Host": "*.teamviewer.com", "Profile": "Restricted", "Comment": "remote support"],
@@ -56,8 +56,9 @@ let data = try! PropertyListSerialization.data(fromPropertyList: full, format: .
 try! data.write(to: URL(fileURLWithPath: plistPath))
 let prefs = try! ManagedPreferences.read(path: plistPath)!
 check("the file is read", prefs.lockSettings && prefs.helperDeliversPolicy && prefs.rules.count == 4 && prefs.profiles.count == 2)
-check("the tunnel switch is read",
-      prefs.tunnelProfileSwitch == TunnelProfileSwitch(enabled: true, connectedProfile: "Work", disconnectedProfile: "Restricted"))
+check("the VPN triggers are read",
+      prefs.tunnelTriggers == [TunnelTrigger(service: nil, whenConnected: true, profile: "Work"),
+                               TunnelTrigger(service: nil, whenConnected: false, profile: "Restricted")])
 check("bindings are normalized", prefs.bindings.first?.gatewayMAC == "aa:bb:cc:dd:ee:01")
 check("managed rules sit above user rules and are grouped",
       prefs.rules.allSatisfy { $0.priority > 100 && $0.groupName == ManagedPreferences.ruleGroupName })
@@ -72,7 +73,12 @@ check("an entry that matches everything is refused", refused(["Rules": [["Commen
 check("a bad mode is refused", refused(["Profiles": [["Name": "X", "Mode": "loud"]]]))
 check("Always cannot be created", refused(["Profiles": [["Name": "always"]]]))
 check("a bad MAC is refused", refused(["NetworkBindings": [["GatewayMAC": "nope", "Profile": "Work"]]]))
-check("a non-dictionary tunnel switch is refused", refused(["TunnelProfileSwitch": true]))
+check("a trigger without When is refused", refused(["VPNTriggers": [["Profile": "Work"]]]))
+check("two triggers with one condition are refused",
+      refused(["VPNTriggers": [["Profile": "Work", "When": "connected"], ["Profile": "Other", "When": "connected"]]]))
+check("a trigger for one VPN service is read",
+      (try? ManagedPreferences.parse(["VPNTriggers": [["Profile": "Work", "When": "connected", "Service": "ABC"]]]))?
+        .tunnelTriggers?.first?.service == "ABC")
 
 // 3. Applying to a real store.
 let store = try RuleStore(path: dir + "/rules.sqlite")
@@ -115,28 +121,26 @@ final class NoGateway: GatewayMACProviding, @unchecked Sendable { func currentGa
 _ = try ManagedPolicySync.apply(prefs, to: store)
 let coordinator = ProfileCoordinator(store: store, watcher: GatewayMACWatcher(provider: NoGateway()))
 var managed = prefs
-coordinator.tunnelSwitchSettings = { if let t = managed.tunnelProfileSwitch { return t }; return try store.tunnelProfileSwitch() }
-coordinator.saveTunnelSwitchSettings = { setting in
-    if managed.tunnelProfileSwitch != nil { throw ProfileValidationError.managedByOrganization("tunnel switch") }
-    try store.setTunnelProfileSwitch(setting)
-}
+coordinator.tunnelTriggers = { if let t = managed.tunnelTriggers { return t }; return try store.tunnelTriggers() }
+coordinator.triggerEditRefusal = { managed.tunnelTriggers != nil ? "VPN triggers are set by MDM" : nil }
 coordinator.userSwitchRefusal = {
-    guard managed.lockSettings, let t = managed.tunnelProfileSwitch, let up = coordinator.currentTunnelState,
-          t.target(tunnelUp: up) != nil else { return nil }
-    return "the profile follows Cloudflare WARP's state"
+    guard managed.lockSettings, let t = managed.tunnelTriggers, let connected = coordinator.currentTunnelConnected,
+          TunnelTrigger.winner(t, connected: connected) != nil else { return nil }
+    return "the profile follows a VPN trigger set by MDM"
 }
-check("the managed tunnel switch applies with nothing stored",
-      coordinator.applyObservedTunnelState(false) && store.activeProfileName() == "Restricted")
-do { try coordinator.setTunnelProfileSwitch(.off); check("the app cannot change a managed tunnel switch", false) }
-catch { check("the app cannot change a managed tunnel switch", true) }
+check("managed triggers apply with nothing stored",
+      coordinator.applyObservedTunnelState([]) && store.activeProfileName() == "Restricted")
+do { try coordinator.setTunnelTrigger(TunnelTrigger(service: nil, whenConnected: true, profile: "Restricted")); check("the app cannot change managed triggers", false) }
+catch { check("the app cannot change managed triggers", true) }
 do { _ = try coordinator.activate(profileName: "Work", reason: .user); check("LockSettings refuses a manual pick", false) }
 catch { check("LockSettings refuses a manual pick: \(error.localizedDescription)", true) }
 check("and the managed profile stays", store.activeProfileName() == "Restricted")
-check("the tunnel itself still switches", coordinator.applyObservedTunnelState(true) && store.activeProfileName() == "Work")
+check("the VPN itself still switches", coordinator.applyObservedTunnelState(["SVC"]) && store.activeProfileName() == "Work")
 managed.lockSettings = false
 check("without LockSettings the user may pick", (try? coordinator.activate(profileName: "Restricted", reason: .user)) != nil)
 managed = .none
-check("once unmanaged, the app may save the switch", (try? coordinator.setTunnelProfileSwitch(.off)) != nil)
+check("once unmanaged, the app may save a trigger",
+      (try? coordinator.setTunnelTrigger(TunnelTrigger(service: nil, whenConnected: true, profile: "Work"))) != nil)
 
 if failures > 0 { print("managed preferences harness: \(failures) FAILURES"); exit(1) }
 print("managed preferences harness: PASS (all checks)")

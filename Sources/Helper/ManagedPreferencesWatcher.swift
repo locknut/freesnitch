@@ -10,7 +10,7 @@ final class ManagedPreferencesWatcher: @unchecked Sendable {
 
     private let path: String
     private let queue = DispatchQueue(label: "io.isaaclins.freesnitch.managed-preferences", qos: .utility)
-    private var directorySource: DispatchSourceFILE?
+    private var directorySource: DispatchSourceFileSystemObject?
     private var timer: DispatchSourceTimer?
     private var lastDigest: String?
     private var lastProblem: String?
@@ -67,7 +67,7 @@ final class ManagedPreferencesWatcher: @unchecked Sendable {
             lastProblem = nil
             PSLog.info(PSLog.helper, data == nil ? "No managed preferences are installed."
                        : "Managed preferences loaded: \(prefs.rules.count) rules, \(prefs.profiles.count) profiles, "
-                       + "tunnel switch \(prefs.tunnelProfileSwitch == nil ? "not managed" : "managed"), "
+                       + "VPN triggers \(prefs.tunnelTriggers.map { "\($0.count) managed" } ?? "not managed"), "
                        + "settings \(prefs.lockSettings ? "locked" : "not locked").")
             onChange?(prefs)
         } catch {

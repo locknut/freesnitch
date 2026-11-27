@@ -5,7 +5,7 @@ import SystemConfiguration
 /// Reads a `TunnelEnvironment` from the running system. A seam so the monitor
 /// can be driven by captured states in tests.
 public protocol TunnelEnvironmentReading: Sendable {
-    func read(for tunnel: TunnelDefinition) -> TunnelEnvironment
+    func read(probe: TunnelProbe) -> TunnelEnvironment
 }
 
 /// The live reader: the dynamic store, `getifaddrs`, and one routing-socket
@@ -14,12 +14,11 @@ public protocol TunnelEnvironmentReading: Sendable {
 public struct SystemTunnelEnvironmentReader: TunnelEnvironmentReading {
     public init() {}
 
-    public func read(for tunnel: TunnelDefinition) -> TunnelEnvironment {
+    public func read(probe: TunnelProbe) -> TunnelEnvironment {
         var failures: [String] = []
         var store: [String: Any] = [:]
         if let session = SCDynamicStoreCreate(nil, "FreeSnitchTunnelReader" as CFString, nil, nil) {
-            let pattern = "State:/Network/Service/\(tunnel.serviceID)/.*" as CFString
-            store = (SCDynamicStoreCopyMultiple(session, nil, [pattern] as CFArray) as? [String: Any]) ?? [:]
+            store = (SCDynamicStoreCopyMultiple(session, nil, TunnelStatus.storePatterns as CFArray) as? [String: Any]) ?? [:]
         } else {
             failures.append("dynamic store: \(String(cString: SCErrorString(SCError())))")
         }
@@ -30,8 +29,8 @@ public struct SystemTunnelEnvironmentReader: TunnelEnvironmentReading {
         }
         var v4: String?
         var v6: String?
-        do { v4 = try Self.routeInterface(to: tunnel.ipv4Probe) } catch { failures.append("IPv4 route: \(error)") }
-        do { v6 = try Self.routeInterface(to: tunnel.ipv6Probe) } catch { failures.append("IPv6 route: \(error)") }
+        do { v4 = try Self.routeInterface(to: probe.ipv4) } catch { failures.append("IPv4 route: \(error)") }
+        do { v6 = try Self.routeInterface(to: probe.ipv6) } catch { failures.append("IPv6 route: \(error)") }
         return TunnelEnvironment(store: store, interfaces: interfaces, ipv4ProbeRoute: v4, ipv6ProbeRoute: v6,
                                  readFailure: failures.isEmpty ? nil : failures.joined(separator: "; "))
     }
@@ -137,35 +136,36 @@ public struct SystemTunnelEnvironmentReader: TunnelEnvironmentReading {
     }
 }
 
-/// Watches the tunnel from the helper (or any process with a dispatch queue;
-/// it needs no run loop and no GUI) and reports every change of the debounced
-/// state. Change notifications from the dynamic store drive it, a slow poll
-/// covers a missed notification, and a pending "up" is re-read when its hold
-/// time ends instead of waiting for the poll.
+/// Watches the tunnel services from the helper (or any process with a
+/// dispatch queue; it needs no run loop and no GUI) and reports every change
+/// of the debounced set of connected services. Dynamic store notifications
+/// drive it, a slow poll covers a missed one, and a pending service is read
+/// again when its hold ends instead of waiting for the poll.
 public final class TunnelMonitor: @unchecked Sendable {
-    public let tunnel: TunnelDefinition
+    public let probe: TunnelProbe
     private let reader: TunnelEnvironmentReading
     private let queue: DispatchQueue
     private let pollInterval: TimeInterval
     private let now: @Sendable () -> Date
-    private var debouncer: TunnelStateDebouncer
+    private var debouncer: TunnelSetDebouncer
     private var store: SCDynamicStore?
     private var pollTimer: DispatchSourceTimer?
     private var holdTimer: DispatchSourceTimer?
-    private var delivered: Bool?
+    private var delivered: Set<String>?
     private var lastReading: TunnelReading?
 
-    /// Called on the monitor's queue with the debounced state and the reading
-    /// that settled it. The first call reports the starting state.
-    public var onChange: ((Bool, TunnelReading) -> Void)?
+    /// Called on the monitor's queue with the settled set of connected
+    /// services and the reading that settled it. The first call reports the
+    /// starting state.
+    public var onChange: ((TunnelState) -> Void)?
 
-    public init(tunnel: TunnelDefinition = .cloudflareWARP,
+    public init(probe: TunnelProbe = .standard,
                 reader: TunnelEnvironmentReading = SystemTunnelEnvironmentReader(),
-                debouncer: TunnelStateDebouncer = TunnelStateDebouncer(),
+                debouncer: TunnelSetDebouncer = TunnelSetDebouncer(),
                 pollInterval: TimeInterval = 30,
                 queue: DispatchQueue = DispatchQueue(label: "io.isaaclins.freesnitch.tunnel", qos: .utility),
                 now: @escaping @Sendable () -> Date = { Date() }) {
-        self.tunnel = tunnel
+        self.probe = probe
         self.reader = reader
         self.debouncer = debouncer
         self.pollInterval = pollInterval
@@ -173,8 +173,10 @@ public final class TunnelMonitor: @unchecked Sendable {
         self.now = now
     }
 
-    /// The debounced state, or nil before the first one was settled.
-    public var currentState: Bool? { queue.sync { delivered } }
+    /// The settled state, or nil before the first one.
+    public var currentState: TunnelState? {
+        queue.sync { delivered.map { TunnelState(connected: $0, services: lastReading?.services ?? []) } }
+    }
     public var currentReading: TunnelReading? { queue.sync { lastReading } }
 
     public func start() {
@@ -187,7 +189,8 @@ public final class TunnelMonitor: @unchecked Sendable {
                 Unmanaged<TunnelMonitor>.fromOpaque(info).takeUnretainedValue().evaluateLocked()
             }
             if let created = SCDynamicStoreCreate(nil, "FreeSnitchTunnelMonitor" as CFString, callback, &context) {
-                if SCDynamicStoreSetNotificationKeys(created, nil, tunnel.storePatterns as CFArray),
+                let patterns = TunnelStatus.storePatterns + TunnelStatus.globalPatterns
+                if SCDynamicStoreSetNotificationKeys(created, nil, patterns as CFArray),
                    SCDynamicStoreSetDispatchQueue(created, queue) {
                     store = created
                 } else {
@@ -212,28 +215,31 @@ public final class TunnelMonitor: @unchecked Sendable {
         }
     }
 
-    /// Reads and decides once, now. Exposed for the helper's status command
-    /// and for tests; the monitor calls it on every notification.
+    /// Reads and decides once, now. The monitor calls it on every
+    /// notification; tests call it directly.
     public func evaluate() { queue.sync { evaluateLocked() } }
 
     private func evaluateLocked() {
-        let reading = TunnelStatus.evaluate(reader.read(for: tunnel), tunnel: tunnel)
+        let reading = TunnelStatus.evaluate(reader.read(probe: probe))
+        let servicesChanged = lastReading?.services != reading.services
         lastReading = reading
         _ = debouncer.observe(reading, at: now())
-        let state = debouncer.isUp
+        let state = debouncer.connected
         scheduleHoldCheckLocked()
-        // At start, an up reading still inside its hold is not yet a state:
-        // reporting "down" first would switch profiles twice on every helper
-        // start while the tunnel is up.
-        if delivered == nil, reading.isUp, !state { return }
-        guard delivered != state else { return }
+        // At start, a tunnel still inside its hold is not yet a state:
+        // reporting "none connected" first would switch profiles twice on
+        // every helper start while a tunnel is up.
+        if delivered == nil, debouncer.hasPending { return }
+        // A service appearing or disappearing is reported too, so the list
+        // offered in the app stays current.
+        guard delivered != state || servicesChanged else { return }
         delivered = state
-        onChange?(state, reading)
+        onChange?(TunnelState(connected: state, services: reading.services))
     }
 
     private func scheduleHoldCheckLocked() {
         holdTimer?.cancel(); holdTimer = nil
-        guard let deadline = debouncer.pendingUpDeadline else { return }
+        guard let deadline = debouncer.nextDeadline else { return }
         let delay = max(0, deadline.timeIntervalSince(now())) + 0.1
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + delay)
@@ -241,4 +247,19 @@ public final class TunnelMonitor: @unchecked Sendable {
         timer.resume()
         holdTimer = timer
     }
+}
+
+/// The settled tunnel state other code acts on.
+public struct TunnelState: Equatable, Sendable {
+    /// Service ids that own the default route, after debouncing.
+    public let connected: Set<String>
+    /// Every tunnel service present, for choosing one in the app.
+    public let services: [TunnelService]
+
+    public init(connected: Set<String>, services: [TunnelService]) {
+        self.connected = connected
+        self.services = services
+    }
+
+    public var anyConnected: Bool { !connected.isEmpty }
 }

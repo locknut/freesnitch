@@ -9,7 +9,7 @@ public enum ProfileValidationError: Error, LocalizedError, Equatable, Sendable {
     case missingProfile(String)
     case missingBlocklist(UUID)
     case invalidGatewayMAC(String)
-    case invalidTunnelProfileSwitch(String)
+    case invalidTunnelTrigger(String)
     case managedByOrganization(String)
 
     public var errorDescription: String? {
@@ -32,8 +32,8 @@ public enum ProfileValidationError: Error, LocalizedError, Equatable, Sendable {
             return String(localized: "Invalid gateway MAC address: \(detail).")
         case .managedByOrganization(let detail):
             return String(localized: "This is managed by your organization: \(detail).")
-        case .invalidTunnelProfileSwitch(let detail):
-            return String(localized: "The tunnel profile switch was not saved: \(detail).")
+        case .invalidTunnelTrigger(let detail):
+            return String(localized: "The VPN trigger was not saved: \(detail).")
         }
     }
 }

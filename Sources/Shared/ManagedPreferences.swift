@@ -6,8 +6,8 @@ import Foundation
 /// `com.apple.ManagedClient.preferences` or custom-settings payload writes to
 /// `/Library/Managed Preferences/io.isaaclins.freesnitch.plist`.
 ///
-/// Managed values take precedence over the user's: a managed tunnel switch
-/// replaces the stored one, managed rules sit above every user rule, and with
+/// Managed values take precedence over the user's: managed VPN triggers
+/// replace the stored ones, managed rules sit above every user rule, and with
 /// `LockSettings` the user cannot change or remove what MDM set. Nothing here
 /// applies without the file; FreeSnitch behaves as before.
 public struct ManagedPreferences: Equatable, Sendable {
@@ -28,7 +28,8 @@ public struct ManagedPreferences: Equatable, Sendable {
         public let profile: String
     }
 
-    public var tunnelProfileSwitch: TunnelProfileSwitch?
+    /// Nil when MDM does not manage triggers; then the user's own apply.
+    public var tunnelTriggers: [TunnelTrigger]?
     public var profiles: [ManagedProfile]
     /// Nil when the key is absent: then rules MDM added earlier are removed.
     public var rules: [Rule]
@@ -36,10 +37,10 @@ public struct ManagedPreferences: Equatable, Sendable {
     public var lockSettings: Bool
     /// The helper delivers policy to the extension itself (see
     /// ExtensionPolicyPusher), so fail-closed fleets get a policy before any
-    /// user logs in. Implied by a configured tunnel switch.
+    /// user logs in. Implied by any VPN trigger.
     public var helperDeliversPolicy: Bool
 
-    public static let none = ManagedPreferences(tunnelProfileSwitch: nil, profiles: [], rules: [], bindings: [],
+    public static let none = ManagedPreferences(tunnelTriggers: nil, profiles: [], rules: [], bindings: [],
                                                 lockSettings: false, helperDeliversPolicy: false)
 
     public enum ParseError: Error, Equatable, LocalizedError {
@@ -77,21 +78,33 @@ public struct ManagedPreferences: Equatable, Sendable {
         var result = ManagedPreferences.none
         result.lockSettings = (dict["LockSettings"] as? Bool) ?? false
 
-        if let raw = dict["TunnelProfileSwitch"] {
-            guard let tunnel = raw as? [String: Any] else {
-                throw ParseError.invalid(key: "TunnelProfileSwitch", reason: "not a dictionary")
-            }
-            func name(_ key: String) throws -> String? {
-                guard let value = tunnel[key] else { return nil }
-                guard let text = value as? String else {
-                    throw ParseError.invalid(key: "TunnelProfileSwitch.\(key)", reason: "not text")
+        if let raw = dict["VPNTriggers"] {
+            guard let list = raw as? [Any] else { throw ParseError.invalid(key: "VPNTriggers", reason: "not an array") }
+            var seen = Set<String>()
+            result.tunnelTriggers = try list.enumerated().map { index, item in
+                let key = "VPNTriggers[\(index)]"
+                guard let entry = item as? [String: Any],
+                      let profile = (entry["Profile"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !profile.isEmpty else {
+                    throw ParseError.invalid(key: key, reason: "needs a Profile")
                 }
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : trimmed
+                let whenConnected: Bool
+                switch (entry["When"] as? String)?.lowercased() {
+                case "connected": whenConnected = true
+                case "disconnected", "not connected": whenConnected = false
+                default: throw ParseError.invalid(key: key, reason: "When must be connected or disconnected")
+                }
+                var service: String?
+                if let raw = entry["Service"] {
+                    guard let text = raw as? String else { throw ParseError.invalid(key: key, reason: "Service is not text") }
+                    service = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                let trigger = TunnelTrigger(service: service, whenConnected: whenConnected, profile: profile)
+                guard seen.insert(trigger.id).inserted else {
+                    throw ParseError.invalid(key: key, reason: "another trigger already has this condition")
+                }
+                return trigger
             }
-            result.tunnelProfileSwitch = TunnelProfileSwitch(enabled: (tunnel["Enabled"] as? Bool) ?? false,
-                                                             connectedProfile: try name("ConnectedProfile"),
-                                                             disconnectedProfile: try name("DisconnectedProfile"))
         }
         result.helperDeliversPolicy = (dict["HelperDeliversPolicy"] as? Bool) ?? false
 
@@ -224,6 +237,9 @@ public enum ManagedPolicySync {
                 return false
             }
             return true
+        }
+        for trigger in prefs.tunnelTriggers ?? [] where store.profile(named: trigger.profile) == nil {
+            outcome.problems.append("a VPN trigger names the profile \(trigger.profile), which does not exist")
         }
         let previous = managedRuleIDs(in: store)
         let wanted = Set(rules.map(\.id))
