@@ -487,7 +487,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ],
             currentGatewayMAC: "a4:2b:8c:11:04:9f",
             notice: nil,
-            canUndo: false)
+            canUndo: false,
+            tunnelTriggers: [
+                TunnelTrigger(service: "8E3F2A61-OFFICE", whenConnected: true, profile: work.name),
+                TunnelTrigger(service: nil, whenConnected: false, profile: home.name)
+            ],
+            tunnelServices: [
+                TunnelService(id: "8E3F2A61-OFFICE", name: "Office VPN"),
+                TunnelService(id: "C07D9B12-TRAVEL", name: "Travel VPN")
+            ],
+            tunnelConnected: [])
         ProfileClient.shared.adoptDemoSnapshot(snapshot)
     }
 

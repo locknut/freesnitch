@@ -68,8 +68,11 @@ public enum VPNStatus {
         let globalSource = (globalDNS?["__CONFIGURATION_ID__"] as? String) ?? ""
 
         var result: [ActiveVPN] = []
-        for key in store.keys.sorted() {
-            guard let serviceID = serviceID(of: key, suffix: "/VPN") else { continue }
+        // Some VPN clients publish a service with a tunnel interface but no
+        // VPN entry; those count as VPNs too (see TunnelStatus).
+        let serviceIDs = Set(store.keys.compactMap { serviceID(of: $0, suffix: "/VPN") })
+            .union(TunnelStatus.tunnelServices(in: store).map(\.service.id))
+        for serviceID in serviceIDs.sorted() {
             let base = "State:/Network/Service/\(serviceID)"
             let interface = interfaceName(store["\(base)/IPv4"]) ?? interfaceName(store["\(base)/IPv6"])
             guard let interface else { continue }
@@ -88,7 +91,11 @@ public enum VPNStatus {
             // resolver the user set anyway.
             let sameServers = (match.isEmpty || claimsDefault) && !servers.isEmpty && !globalServers.isEmpty
                 && globalServers.isSubset(of: Set(servers))
-            result.append(ActiveVPN(name: setup?["UserDefinedName"] as? String,
+            // A service with no user-defined name is named by its id, which
+            // such clients choose to be readable.
+            let name = (setup?["UserDefinedName"] as? String)
+                ?? (store["\(base)/VPN"] == nil ? serviceID : nil)
+            result.append(ActiveVPN(name: name,
                                     interface: interface,
                                     dnsServers: servers,
                                     matchDomains: match,

@@ -394,7 +394,7 @@ rule_transport_gate() {
 }
 
 rule_transport_gate "$FILTER" \
-  'private func receiveSnapshot(_ data: Data)' \
+  'private func receiveSnapshot(_ data: Data' \
   'try RuleTransportBoundary.validateSnapshotBytes(data)' \
   'SharedRuleBridge.decode(data)' \
   'network extension live snapshot'

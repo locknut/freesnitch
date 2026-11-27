@@ -189,6 +189,9 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// Set only while `snapshotOrigin == .boot`; a live resend is checked
     /// against it, not against the copy this extension relaxed (#455).
     private var savedBootPolicy: SharedRuleBridge.Snapshot?
+    /// Whether the live policy in force was handed over by the helper itself
+    /// rather than relayed by the app. Guarded by `snapshotLock`.
+    private var liveSnapshotFromHelper = false
     private var snapshotStatus = SharedRuleBridge.SnapshotStatus.unavailable(
         "Network extension has not received a rule snapshot from the GUI."
     )
@@ -250,11 +253,11 @@ final class FilterDataProvider: NEFilterDataProvider {
     }
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
-        IPCConnection.shared.onSnapshot = { [weak self] data in
+        IPCConnection.shared.onSnapshot = { [weak self] data, source in
             guard let self else {
                 return .unavailable("Network extension stopped before receiving the rule snapshot.")
             }
-            return self.receiveSnapshot(data)
+            return self.receiveSnapshot(data, from: source)
         }
         IPCConnection.shared.snapshotStatus = { [weak self] in
             self?.readSnapshotStatus()
@@ -1018,7 +1021,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
     }
 
-    private func receiveSnapshot(_ data: Data) -> SharedRuleBridge.SnapshotStatus {
+    private func receiveSnapshot(_ data: Data, from source: IPCConnection.SnapshotSource = .app) -> SharedRuleBridge.SnapshotStatus {
         do {
             try RuleTransportBoundary.validateSnapshotBytes(data)
             let received = try SharedRuleBridge.decode(data)
@@ -1056,6 +1059,20 @@ final class FilterDataProvider: NEFilterDataProvider {
                 return status
             }
             if let current, received.generation < current.generation {
+                // The helper delivers its policy directly too. An app relay
+                // that read the helper just before a change can arrive after
+                // the helper's own newer delivery: it is still not applied,
+                // but it is not a refusal either, because the policy in force
+                // is newer and from the same owner. Reporting it as refused
+                // would have the app restart the filter for nothing.
+                if authority == .sameSession, source == .app, snapshotOrigin == .live, liveSnapshotFromHelper {
+                    let status = SharedRuleBridge.SnapshotStatus.ready(for: current)
+                    snapshotStatus = status
+                    snapshotLock.unlock()
+                    PSLog.info(PSLog.netext,
+                               "kept generation \(current.generation) from the helper over the app's older relay of generation \(received.generation)")
+                    return status
+                }
                 // Only inside one helper session is a lower generation a
                 // rollback. Across sessions it is the owner restarting, and
                 // the epoch above has already ranked it.
@@ -1102,6 +1119,8 @@ final class FilterDataProvider: NEFilterDataProvider {
                 let status = SharedRuleBridge.SnapshotStatus.ready(for: accepted)
                 setSnapshotLocked(accepted)
                 snapshotOrigin = .live
+                // An idempotent resend changes nothing about who delivered it.
+                if decision == .accepted { liveSnapshotFromHelper = source == .helper }
                 savedBootPolicy = nil
                 snapshotStatus = status
                 // Queued (not written) while the lock is held, so records land
