@@ -41,6 +41,9 @@ public final class IPCConnection: NSObject, @unchecked Sendable {
     /// Extension side: invoked when the app pushes a rule set. It returns the
     /// provider's resulting status synchronously so the app can publish it.
     public var onSnapshot: ((Data, SnapshotSource) -> SharedRuleBridge.SnapshotStatus)?
+    /// Extension side: a peer asked which policy is in force (`register`).
+    /// The helper does this between changes instead of resending its policy.
+    public var onCheckIn: ((SnapshotSource) -> Void)?
     /// Extension side: supplies the current status during registration.
     public var snapshotStatus: (() -> SharedRuleBridge.SnapshotStatus)?
     /// App side: the connection made by `register` was interrupted or
@@ -316,6 +319,7 @@ private final class ProviderEndpoint: NSObject, ProviderCommunication {
 
     func register(_ completionHandler: @escaping (Bool, Data) -> Void) {
         guard let owner else { completionHandler(false, Data()); return }
+        owner.onCheckIn?(source)
         owner.register(completionHandler)
     }
 
