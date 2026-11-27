@@ -24,6 +24,15 @@ grep -Fq 'setFailClosed(FailClosedPolicy.builtInRecoveryRules)' "$FILTER" \
   || fail "a malformed fail-closed configuration no longer keeps fail-closed on"
 pass "fail-open stays the default; fail-closed only replaces a missing policy"
 
+grep -Fq 'DispatchTime.now().uptimeNanoseconds &- lastPolicyDeliveryNanos > maximumPolicyAgeNanos' "$FILTER" \
+  || fail "a policy older than MaximumPolicyAge is no longer treated as no policy"
+grep -Fq 'lastPolicyDeliveryNanos = DispatchTime.now().uptimeNanoseconds' "$FILTER" \
+  || fail "a delivered policy no longer refreshes its age"
+recovery_body="$(awk '/private func currentPolicy\(\)/{f=1} f{print} f&&/^    }$/{exit}' "$FILTER")"
+grep -Fq 'PSLog' <<<"$(sed -n '/snapshotLock.lock()/,/snapshotLock.unlock()/p' <<<"$recovery_body")" \
+  && fail "currentPolicy logs while holding the policy lock"
+pass "an undelivered policy expires into fail-closed (opt-in), logged outside the lock"
+
 cat > "$TMP/main.swift" <<'SWIFT'
 import Foundation
 
@@ -57,6 +66,17 @@ let policy = try! FailClosedPolicy.parse(config)
 check("an MDM-style dictionary is read", policy.enabled && policy.recoveryRules.count == 6)
 check("every recovery rule allows and is grouped", policy.recoveryRules.allSatisfy { $0.action == .allow && $0.groupName == FailClosedPolicy.groupName })
 check("built-in Apple entries come first", policy.effectiveRules.prefix(FailClosedPolicy.builtInRecoveryRules.count).elementsEqual(FailClosedPolicy.builtInRecoveryRules))
+
+// 1b. MaximumPolicyAge.
+let aged = try! FailClosedPolicy.parse(["Enabled": true, "MaximumPolicyAge": 120])
+check("MaximumPolicyAge is read", aged.maximumPolicyAge == 120)
+check("a policy within the age is fresh", !aged.policyIsStale(age: 119))
+check("a policy past the age is stale", aged.policyIsStale(age: 121))
+check("without MaximumPolicyAge a policy never goes stale", !policy.policyIsStale(age: 1_000_000))
+check("with fail-closed off nothing goes stale",
+      !(try! FailClosedPolicy.parse(["Enabled": false, "MaximumPolicyAge": 120])).policyIsStale(age: 1_000_000))
+check("an age below the minimum is refused", refused(["Enabled": true, "MaximumPolicyAge": 10]))
+check("an age given as text is refused", refused(["Enabled": true, "MaximumPolicyAge": "120"]))
 
 // 2. Entries that would be unsafe or meaningless are refused.
 check("an empty entry (allow everything) is refused", refused(["Enabled": true, "RecoveryEntries": [["Comment": "x"]]]))

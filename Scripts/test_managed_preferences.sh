@@ -142,10 +142,39 @@ managed = .none
 check("once unmanaged, the app may save a trigger",
       (try? coordinator.setTunnelTrigger(TunnelTrigger(service: nil, whenConnected: true, profile: "Work"))) != nil)
 
+// 5. The helper's watcher: removal, malformed files and repeats.
+let watchedPath = dir + "/watched/io.isaaclins.freesnitch.plist"
+try FileManager.default.createDirectory(atPath: dir + "/watched", withIntermediateDirectories: true)
+let watcher = ManagedPreferencesWatcher(path: watchedPath)
+var seen: [ManagedPreferences] = []
+watcher.onChange = { seen.append($0) }
+watcher.checkNow()
+check("no file at start reports unmanaged", seen == [.none])
+try! PropertyListSerialization.data(fromPropertyList: ["LockSettings": true], format: .xml, options: 0)
+    .write(to: URL(fileURLWithPath: watchedPath))
+watcher.checkNow()
+check("a new file is reported", seen.count == 2 && seen.last?.lockSettings == true)
+watcher.checkNow()
+check("an unchanged file is not reported again", seen.count == 2)
+try! Data("<plist><dict><key>Rules</key><string>oops".utf8).write(to: URL(fileURLWithPath: watchedPath))
+watcher.checkNow()
+check("a malformed file is not reported, so what was applied stays", seen.count == 2)
+try! PropertyListSerialization.data(fromPropertyList: ["Rules": [["Host": "ok.example"], ["BundleID": "com.example.App"]]], format: .xml, options: 0)
+    .write(to: URL(fileURLWithPath: watchedPath))
+watcher.checkNow()
+check("an invalid entry refuses the whole file", seen.count == 2)
+try! PropertyListSerialization.data(fromPropertyList: ["LockSettings": false], format: .xml, options: 0)
+    .write(to: URL(fileURLWithPath: watchedPath))
+watcher.checkNow()
+check("a corrected file is reported", seen.count == 3 && seen.last?.lockSettings == false)
+try FileManager.default.removeItem(atPath: watchedPath)
+watcher.checkNow()
+check("a removed profile (file gone) reports unmanaged", seen.count == 4 && seen.last == ManagedPreferences.none)
+
 if failures > 0 { print("managed preferences harness: \(failures) FAILURES"); exit(1) }
 print("managed preferences harness: PASS (all checks)")
 SWIFT
 
 xcrun swiftc -sdk "$(xcrun --show-sdk-path)" -target arm64-apple-macos13.0 \
-  "$ROOT"/Sources/Shared/*.swift "$TMP/main.swift" -lsqlite3 -o "$TMP/run"
+  "$ROOT"/Sources/Shared/*.swift "$ROOT/Sources/Helper/ManagedPreferencesWatcher.swift" "$TMP/main.swift" -lsqlite3 -o "$TMP/run"
 "$TMP/run" "$TMP"

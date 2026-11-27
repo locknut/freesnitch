@@ -198,6 +198,14 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// Written only in `startFilter`, before any flow.
     private var failClosedRules: PreparedRuleSet?
     private var failClosedSnapshot: SharedRuleBridge.Snapshot?
+    /// Opt-in: seconds after which a policy not delivered again counts as no
+    /// policy. Written only in `startFilter`.
+    private var maximumPolicyAgeNanos: UInt64?
+    /// When the policy in force was last delivered (accepted or resent
+    /// unchanged), in uptime nanoseconds. Guarded by `snapshotLock`.
+    private var lastPolicyDeliveryNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
+    /// Logged once per stale episode. Guarded by `snapshotLock`.
+    private var staleLogged = false
     private var snapshotStatus = SharedRuleBridge.SnapshotStatus.unavailable(
         "Network extension has not received a rule snapshot from the GUI."
     )
@@ -297,6 +305,7 @@ final class FilterDataProvider: NEFilterDataProvider {
             return
         }
         guard policy.enabled else { failClosedRules = nil; failClosedSnapshot = nil; return }
+        maximumPolicyAgeNanos = policy.maximumPolicyAge.map { UInt64($0 * 1_000_000_000) }
         setFailClosed(policy.effectiveRules)
         PSLog.info(PSLog.netext, "fail-closed is on: with no policy in force, only \(policy.effectiveRules.count) recovery rules allow traffic")
     }
@@ -1163,8 +1172,11 @@ final class FilterDataProvider: NEFilterDataProvider {
                 let status = SharedRuleBridge.SnapshotStatus.ready(for: accepted)
                 setSnapshotLocked(accepted)
                 snapshotOrigin = .live
-                // An idempotent resend changes nothing about who delivered it.
+                // An idempotent resend changes nothing about who delivered it,
+                // but it does show the sender is alive (MaximumPolicyAge).
                 if decision == .accepted { liveSnapshotFromHelper = source == .helper }
+                lastPolicyDeliveryNanos = DispatchTime.now().uptimeNanoseconds
+                staleLogged = false
                 savedBootPolicy = nil
                 snapshotStatus = status
                 // Queued (not written) while the lock is held, so records land
@@ -1222,14 +1234,30 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     private func currentPolicy() -> (snapshot: SharedRuleBridge.Snapshot?, origin: SnapshotOrigin, prepared: PreparedRuleSet) {
         snapshotLock.lock()
-        defer { snapshotLock.unlock() }
-        // Opt-in fail-closed: with no policy in force, flows are judged by the
-        // recovery policy, which is Silent Deny (it never asks) plus the
-        // recovery rules. The origin stays `.none`.
+        var becameStale = false
+        let result: (snapshot: SharedRuleBridge.Snapshot?, origin: SnapshotOrigin, prepared: PreparedRuleSet)
         if snapshot == nil, let failClosedSnapshot, let failClosedRules {
-            return (failClosedSnapshot, snapshotOrigin, failClosedRules)
+            // Opt-in fail-closed: with no policy in force, flows are judged by
+            // the recovery policy, which is Silent Deny (it never asks) plus
+            // the recovery rules. The origin stays `.none`.
+            result = (failClosedSnapshot, snapshotOrigin, failClosedRules)
+        } else if let maximumPolicyAgeNanos, let failClosedSnapshot, let failClosedRules,
+                  DispatchTime.now().uptimeNanoseconds &- lastPolicyDeliveryNanos > maximumPolicyAgeNanos {
+            // Opt-in MaximumPolicyAge: a policy nobody has delivered again in
+            // time is treated like no policy.
+            becameStale = !staleLogged
+            staleLogged = true
+            result = (failClosedSnapshot, snapshotOrigin, failClosedRules)
+        } else {
+            result = (snapshot, snapshotOrigin, preparedRules)
         }
-        return (snapshot, snapshotOrigin, preparedRules)
+        snapshotLock.unlock()
+        // Logged outside the lock, once per stale episode.
+        if becameStale {
+            PSLog.error(PSLog.netext, "no policy was delivered within the maximum policy age; "
+                        + "filtering is fail-closed (recovery list only) until one arrives")
+        }
+        return result
     }
 
     private func readSnapshotStatus() -> SharedRuleBridge.SnapshotStatus {

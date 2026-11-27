@@ -20,13 +20,30 @@ public struct FailClosedPolicy: Equatable, Sendable {
     public var enabled: Bool
     /// The administrator's recovery entries, already turned into allow rules.
     public var recoveryRules: [Rule]
+    /// Optional: a policy not delivered again within this many seconds is
+    /// treated as no policy, so the recovery policy applies. Meant for fleets
+    /// where the helper delivers policy (it resends every 15 s): if the
+    /// helper stops (crashed, unloaded, removed), the filter does not keep
+    /// enforcing a stale and possibly permissive profile forever. Without
+    /// helper delivery the app sends policy only on changes, so leave this
+    /// unset there.
+    public var maximumPolicyAge: TimeInterval?
 
-    public init(enabled: Bool, recoveryRules: [Rule]) {
+    public static let minimumPolicyAge: TimeInterval = 60
+
+    public init(enabled: Bool, recoveryRules: [Rule], maximumPolicyAge: TimeInterval? = nil) {
         self.enabled = enabled
         self.recoveryRules = recoveryRules
+        self.maximumPolicyAge = maximumPolicyAge
     }
 
     public static let off = FailClosedPolicy(enabled: false, recoveryRules: [])
+
+    /// Whether a policy last delivered `age` seconds ago is too old to keep.
+    public func policyIsStale(age: TimeInterval) -> Bool {
+        guard enabled, let maximumPolicyAge else { return false }
+        return age > maximumPolicyAge
+    }
 
     /// The rules in force while no policy is: Apple's own device management,
     /// push, time and captive portal first, then the administrator's entries.
@@ -63,7 +80,8 @@ public struct FailClosedPolicy: Equatable, Sendable {
         public var errorDescription: String? {
             switch self {
             case .notADictionary: return "the fail-closed configuration is not a dictionary"
-            case .invalidEntry(let index, let reason): return "recovery entry \(index + 1): \(reason)"
+            case .invalidEntry(let index, let reason):
+                return index < 0 ? reason : "recovery entry \(index + 1): \(reason)"
             }
         }
     }
@@ -103,7 +121,14 @@ public struct FailClosedPolicy: Equatable, Sendable {
             }
             rules.append(try rule(from: entry, index: index))
         }
-        return FailClosedPolicy(enabled: enabled, recoveryRules: rules)
+        var maximumAge: TimeInterval?
+        if let raw = dict["MaximumPolicyAge"] {
+            guard let seconds = raw as? Int, TimeInterval(seconds) >= minimumPolicyAge else {
+                throw ParseError.invalidEntry(index: -1, reason: "MaximumPolicyAge must be a number of seconds, at least \(Int(minimumPolicyAge))")
+            }
+            maximumAge = TimeInterval(seconds)
+        }
+        return FailClosedPolicy(enabled: enabled, recoveryRules: rules, maximumPolicyAge: maximumAge)
     }
 
     static func rule(from entry: [String: Any], index: Int) throws -> Rule {
