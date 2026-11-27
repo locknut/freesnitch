@@ -467,7 +467,7 @@ struct ProfilesSettingsView: View {
                 Picker("VPN", selection: $newTriggerService) {
                     Text("any VPN").tag(String?.none)
                     ForEach(tunnelServices) { service in
-                        Text(service.displayName).tag(String?.some(service.id))
+                        Text(serviceMenuLabel(service)).tag(String?.some(service.id))
                     }
                 }
                 .labelsHidden()
@@ -511,6 +511,13 @@ struct ProfilesSettingsView: View {
     }
 
     private var tunnelServices: [TunnelService] { profileClient.snapshot?.tunnelServices ?? [] }
+
+    /// "Name", or "Name (not connected)" for a VPN that is not carrying
+    /// traffic now, including one that is down and only remembered.
+    private func serviceMenuLabel(_ service: TunnelService) -> String {
+        let connected = profileClient.snapshot?.tunnelConnected?.contains(service.id) == true
+        return connected ? service.displayName : String(localized: "\(service.displayName) (not connected)")
+    }
 
     private func serviceName(_ id: String?) -> String {
         guard let id else { return String(localized: "Any VPN") }

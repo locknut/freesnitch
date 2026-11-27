@@ -443,7 +443,17 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
             return "the profile follows a VPN trigger set by MDM"
         }
         profiles.tunnelTriggersManaged = { [weak self] in self?.managed.tunnelTriggers != nil }
-        profiles.tunnelServices = { [weak self] in self?.tunnelMonitor.currentState?.services ?? [] }
+        // Every VPN service seen so far, plus any a trigger names, so a VPN
+        // that is down (and whose service macOS removed) can still be chosen.
+        profiles.tunnelServices = { [weak self] in
+            guard let self else { return [] }
+            var services = KnownTunnelServices.all(in: self.store)
+            for id in ((try? self.profileCoordinator.tunnelTriggers()) ?? []).compactMap(\.service)
+            where !services.contains(where: { $0.id == id }) {
+                services.append(TunnelService(id: id, name: nil))
+            }
+            return services
+        }
         managedWatcher.onChange = { [weak self] prefs in
             self?.profileQueue.async { self?.applyManaged(prefs) }
         }
@@ -493,7 +503,12 @@ final class HelperService: NSObject, HelperProtocol, @unchecked Sendable {
             guard let self else { return }
             PSLog.info(PSLog.helper, state.connected.isEmpty ? "No VPN owns the default route."
                        : "VPN services owning the default route: \(state.connected.sorted().joined(separator: ", ")).")
-            self.profileQueue.async { self.applyTunnelState(state.connected) }
+            self.profileQueue.async {
+                do { try KnownTunnelServices.remember(state.services, in: self.store) } catch {
+                    PSLog.error(PSLog.helper, "VPN services seen could not be remembered: \(error.localizedDescription)")
+                }
+                self.applyTunnelState(state.connected)
+            }
         }
         tunnelMonitor.start()
         extensionPusher?.start()

@@ -83,3 +83,60 @@ extension RuleStore {
         try setSetting(TunnelTrigger.settingKey, String(decoding: try JSONEncoder().encode(sorted), as: UTF8.self))
     }
 }
+
+/// Every VPN service the helper has seen, so a VPN that is down (whose
+/// service macOS removes entirely, for some clients) can still be chosen for
+/// a trigger and is still shown by its name. Bounded: the services seen
+/// longest ago are forgotten first.
+public enum KnownTunnelServices {
+    public static let settingKey = "known_tunnel_services"
+    public static let maximumCount = 64
+
+    struct Entry: Codable, Equatable {
+        var id: String
+        var name: String?
+        var lastSeen: Date
+    }
+
+    /// The services remembered, by display name then id.
+    public static func all(in store: RuleStore) -> [TunnelService] {
+        entries(in: store).map { TunnelService(id: $0.id, name: $0.name) }
+            .sorted { ($0.displayName.lowercased(), $0.id) < ($1.displayName.lowercased(), $1.id) }
+    }
+
+    /// Records the services seen now. A name seen before is kept when the
+    /// service now has none. Writes only when something changed, apart from
+    /// refreshing `lastSeen` at most once a day, so a steady state costs no
+    /// writes.
+    @discardableResult
+    public static func remember(_ services: [TunnelService], in store: RuleStore, at now: Date = Date()) throws -> Bool {
+        guard !services.isEmpty else { return false }
+        var byID = Dictionary(entries(in: store).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var changed = false
+        for service in services {
+            if var entry = byID[service.id] {
+                let name = service.name ?? entry.name
+                if name != entry.name || now.timeIntervalSince(entry.lastSeen) > 24 * 60 * 60 {
+                    entry.name = name
+                    entry.lastSeen = now
+                    byID[service.id] = entry
+                    changed = true
+                }
+            } else {
+                byID[service.id] = Entry(id: service.id, name: service.name, lastSeen: now)
+                changed = true
+            }
+        }
+        guard changed else { return false }
+        let kept = byID.values.sorted { $0.lastSeen > $1.lastSeen }.prefix(maximumCount)
+        let data = try JSONEncoder().encode(Array(kept))
+        try store.setSetting(settingKey, String(decoding: data, as: UTF8.self))
+        return true
+    }
+
+    static func entries(in store: RuleStore) -> [Entry] {
+        guard let raw = store.getSetting(settingKey),
+              let list = try? JSONDecoder().decode([Entry].self, from: Data(raw.utf8)) else { return [] }
+        return list
+    }
+}

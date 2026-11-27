@@ -122,6 +122,38 @@ coordinator.triggerEditRefusal = { "VPN triggers are set by MDM" }
 do { try coordinator.setTunnelTrigger(TunnelTrigger(service: nil, whenConnected: true, profile: "Work")); check("a refused edit throws", false) }
 catch { check("a refused edit throws: \(error.localizedDescription)", true) }
 
+// 9. A named VPN whose service is completely absent (some clients remove
+//    their service when disconnected) is "not connected".
+let absent = TunnelTrigger(service: "CloudflareWARP", whenConnected: false, profile: "Restricted")
+check("a named VPN that is absent matches its not-connected trigger", absent.matches([]) && absent.matches([office]))
+check("and wins over any-VPN-not-connected", TunnelTrigger.winner([anyDown, absent], connected: []) == absent)
+coordinator.triggerEditRefusal = nil
+try coordinator.setTunnelTrigger(absent)
+_ = try coordinator.activate(profileName: "Office", reason: .user)
+check("with its service gone, the trigger switches", coordinator.applyObservedTunnelState([travel]) && store.activeProfileName() == "Restricted")
+
+// 10. Remembering the VPN services seen.
+let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+check("nothing is remembered at first", KnownTunnelServices.all(in: store).isEmpty)
+check("services seen are remembered",
+      try KnownTunnelServices.remember([TunnelService(id: "CloudflareWARP", name: nil), TunnelService(id: office, name: "Office VPN")], in: store, at: t0))
+check("they are listed by name, the unnamed one by its id",
+      KnownTunnelServices.all(in: store).map(\.displayName) == ["CloudflareWARP", "Office VPN"])
+check("seeing the same again writes nothing",
+      try !KnownTunnelServices.remember([TunnelService(id: office, name: "Office VPN")], in: store, at: t0.addingTimeInterval(60)))
+check("a service that disappears is still listed",
+      try !KnownTunnelServices.remember([TunnelService(id: office, name: "Office VPN")], in: store, at: t0.addingTimeInterval(120))
+      && KnownTunnelServices.all(in: store).contains { $0.id == "CloudflareWARP" })
+_ = try KnownTunnelServices.remember([TunnelService(id: office, name: nil)], in: store, at: t0.addingTimeInterval(180))
+check("a name seen before is kept when the service now has none",
+      KnownTunnelServices.all(in: store).first { $0.id == office }?.name == "Office VPN")
+check("a renamed service is updated",
+      try KnownTunnelServices.remember([TunnelService(id: office, name: "HQ VPN")], in: store, at: t0.addingTimeInterval(240))
+      && KnownTunnelServices.all(in: store).first { $0.id == office }?.name == "HQ VPN")
+let many = (0..<(KnownTunnelServices.maximumCount + 10)).map { TunnelService(id: "S\($0)", name: nil) }
+_ = try KnownTunnelServices.remember(many, in: store, at: t0.addingTimeInterval(1000))
+check("the list is bounded", KnownTunnelServices.all(in: store).count == KnownTunnelServices.maximumCount)
+
 if failures > 0 { print("tunnel trigger harness: \(failures) FAILURES"); exit(1) }
 print("tunnel trigger harness: PASS (all checks)")
 SWIFT
