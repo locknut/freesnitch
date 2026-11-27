@@ -189,6 +189,20 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// Set only while `snapshotOrigin == .boot`; a live resend is checked
     /// against it, not against the copy this extension relaxed (#455).
     private var savedBootPolicy: SharedRuleBridge.Snapshot?
+    /// The opt-in fail-closed recovery policy (Silent Deny plus the recovery
+    /// rules) and its prepared order, used while no policy is in force. Nil
+    /// when fail-closed is off: no policy then means allow, as it always has.
+    /// Written only in `startFilter`, before any flow.
+    private var failClosedRules: PreparedRuleSet?
+    private var failClosedSnapshot: SharedRuleBridge.Snapshot?
+    /// Opt-in: seconds after which a policy not delivered again counts as no
+    /// policy. Written only in `startFilter`.
+    private var maximumPolicyAgeNanos: UInt64?
+    /// When the policy in force was last delivered (accepted or resent
+    /// unchanged), in uptime nanoseconds. Guarded by `snapshotLock`.
+    private var lastPolicyDeliveryNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
+    /// Logged once per stale episode. Guarded by `snapshotLock`.
+    private var staleLogged = false
     private var snapshotStatus = SharedRuleBridge.SnapshotStatus.unavailable(
         "Network extension has not received a rule snapshot from the GUI."
     )
@@ -267,8 +281,38 @@ final class FilterDataProvider: NEFilterDataProvider {
         // live XPC snapshot is authoritative, and a later persisted read must
         // never replace a live policy.
         PSLog.info(PSLog.netext, "FILTER START: reading persisted provider boot policy")
+        loadFailClosedPolicy()
         loadPersistedBootSnapshot()
         startFilterAfterBootSnapshot(completionHandler: completionHandler)
+    }
+
+    /// Reads the opt-in fail-closed configuration (set by an MDM content
+    /// filter payload's VendorConfig). A malformed value keeps fail-closed on
+    /// with the built-in recovery list only: an administrator who asked for
+    /// fail-closed must not get fail-open from a typo.
+    private func loadFailClosedPolicy() {
+        let vendor = filterConfiguration.vendorConfiguration
+        let policy: FailClosedPolicy
+        do {
+            policy = try FailClosedPolicy.read(fromVendorConfiguration: vendor)
+        } catch {
+            PSLog.error(PSLog.netext, "fail-closed configuration is malformed (\(error.localizedDescription)); "
+                        + "staying fail-closed with only the built-in recovery list")
+            setFailClosed(FailClosedPolicy.builtInRecoveryRules)
+            return
+        }
+        guard policy.enabled else { failClosedRules = nil; failClosedSnapshot = nil; return }
+        maximumPolicyAgeNanos = policy.maximumPolicyAge.map { UInt64($0 * 1_000_000_000) }
+        setFailClosed(policy.effectiveRules)
+        PSLog.info(PSLog.netext, "fail-closed is on: with no policy in force, only \(policy.effectiveRules.count) recovery rules allow traffic")
+    }
+
+    private func setFailClosed(_ rules: [Rule]) {
+        // Generation and session zero: never comparable to, and never
+        // preferred over, a real policy. It is not stored as `snapshot`, so
+        // the snapshot ordering checks never see it.
+        failClosedSnapshot = SharedRuleBridge.Snapshot(mode: .silentDeny, rules: rules, generation: 0, epoch: 0)
+        failClosedRules = PreparedRuleSet(rules: rules)
     }
 
     private func loadPersistedBootSnapshot() {
@@ -291,7 +335,12 @@ final class FilterDataProvider: NEFilterDataProvider {
         preparedRules = PreparedRuleSet(rules: newValue?.rules ?? [])
     }
 
-    private func clearBootSnapshot(_ message: String) {
+    private func clearBootSnapshot(_ rawMessage: String) {
+        // The messages say what happens next; with fail-closed on, that is
+        // the recovery list, not fail-open.
+        let message = failClosedRules == nil ? rawMessage
+            : rawMessage.replacingOccurrences(of: "filtering will fail open",
+                                              with: "filtering is fail-closed: only the recovery list is allowed")
         snapshotLock.lock()
         let liveSnapshotAlreadyLoaded = snapshotOrigin == .live
         if !liveSnapshotAlreadyLoaded {
@@ -353,7 +402,8 @@ final class FilterDataProvider: NEFilterDataProvider {
             // No GUI-delivered policy is a degraded state, not an alert-mode
             // policy. Allowing here keeps a missing GUI from becoming a network
             // outage while the published status tells the UI that filtering is
-            // not ready.
+            // not ready. (With opt-in fail-closed, `currentPolicy` supplies the
+            // recovery policy instead, so this is reached only without it.)
             observe(.unfiltered)
             return .allow()
         }
@@ -822,7 +872,10 @@ final class FilterDataProvider: NEFilterDataProvider {
                                               remotePort: conn.remotePort,
                                               remoteIP: conn.remoteIP,
                                               senderIsRoot: flow.sourceAppAuditToken.flatMap(auditTokenEUID).map { $0 == 0 }) { return true }
-        guard conn.remotePort == 53, snapshotOrigin == .boot else { return false }
+        // Fail-closed with no policy needs name resolution too, or no
+        // recovery host could be reached; only toward configured resolvers.
+        let failClosedWithoutPolicy = snapshotOrigin == .none && failClosedRules != nil
+        guard conn.remotePort == 53, snapshotOrigin == .boot || failClosedWithoutPolicy else { return false }
         let lookup = conn.remoteIP.isEmpty ? FlowDestination.unspecifiedLookupToken : conn.remoteIP
         return resolverBypass.allowsDNS(to: lookup)
     }
@@ -1102,6 +1155,10 @@ final class FilterDataProvider: NEFilterDataProvider {
                 let status = SharedRuleBridge.SnapshotStatus.ready(for: accepted)
                 setSnapshotLocked(accepted)
                 snapshotOrigin = .live
+                // An accepted or idempotent delivery shows the sender is alive
+                // (MaximumPolicyAge).
+                lastPolicyDeliveryNanos = DispatchTime.now().uptimeNanoseconds
+                staleLogged = false
                 savedBootPolicy = nil
                 snapshotStatus = status
                 // Queued (not written) while the lock is held, so records land
@@ -1159,8 +1216,30 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     private func currentPolicy() -> (snapshot: SharedRuleBridge.Snapshot?, origin: SnapshotOrigin, prepared: PreparedRuleSet) {
         snapshotLock.lock()
-        defer { snapshotLock.unlock() }
-        return (snapshot, snapshotOrigin, preparedRules)
+        var becameStale = false
+        let result: (snapshot: SharedRuleBridge.Snapshot?, origin: SnapshotOrigin, prepared: PreparedRuleSet)
+        if snapshot == nil, let failClosedSnapshot, let failClosedRules {
+            // Opt-in fail-closed: with no policy in force, flows are judged by
+            // the recovery policy, which is Silent Deny (it never asks) plus
+            // the recovery rules. The origin stays `.none`.
+            result = (failClosedSnapshot, snapshotOrigin, failClosedRules)
+        } else if let maximumPolicyAgeNanos, let failClosedSnapshot, let failClosedRules,
+                  DispatchTime.now().uptimeNanoseconds &- lastPolicyDeliveryNanos > maximumPolicyAgeNanos {
+            // Opt-in MaximumPolicyAge: a policy nobody has delivered again in
+            // time is treated like no policy.
+            becameStale = !staleLogged
+            staleLogged = true
+            result = (failClosedSnapshot, snapshotOrigin, failClosedRules)
+        } else {
+            result = (snapshot, snapshotOrigin, preparedRules)
+        }
+        snapshotLock.unlock()
+        // Logged outside the lock, once per stale episode.
+        if becameStale {
+            PSLog.error(PSLog.netext, "no policy was delivered within the maximum policy age; "
+                        + "filtering is fail-closed (recovery list only) until one arrives")
+        }
+        return result
     }
 
     private func readSnapshotStatus() -> SharedRuleBridge.SnapshotStatus {

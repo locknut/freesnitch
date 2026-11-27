@@ -164,6 +164,8 @@ Rules layer exactly twice: the `Always` set plus the active profile's own rules.
 
 A network is recognised by the MAC address of its default gateway. FreeSnitch never reads the Wi-Fi network name and never asks for Location Services. A network only ever selects a profile after you bind it with "use this here"; an unknown network changes nothing.
 
+An administrator can make the network extension fail closed instead of open while it holds no policy; see [docs/fail-closed.md](docs/fail-closed.md).
+
 Switching profiles affects new connections only. Verdicts are made in `handleNewFlow`, so replacing the active rule set cannot retroactively drop an established session such as SSH. Every switch is announced with the active and paused rule counts and an Undo, and the active profile is always visible in the menu bar.
 
 ### Menubar Status Item
