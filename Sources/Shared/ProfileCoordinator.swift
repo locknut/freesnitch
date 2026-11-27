@@ -70,7 +70,7 @@ public final class ProfileCoordinator: @unchecked Sendable {
     /// The trigger whose switch is still owed because activating failed.
     private var pendingTunnel: TunnelTrigger?
     /// Where the triggers are read from. The store by default; the helper
-    /// can replace it.
+    /// replaces it when MDM manages them.
     public var tunnelTriggers: () throws -> [TunnelTrigger]
     /// Runs inside a network switch, after its binding was read and before it
     /// is applied. Only the profiles harness sets it, to replay a manual pick
@@ -172,6 +172,9 @@ public final class ProfileCoordinator: @unchecked Sendable {
     public func activate(profileName: String, reason: SwitchReason = .user) throws -> SwitchResult {
         switchSerial.lock()
         defer { switchSerial.unlock() }
+        if reason == .user || reason == .undo, let refusal = userSwitchRefusal?() {
+            throw ProfileValidationError.managedByOrganization(refusal)
+        }
         let previousName = store.activeProfileName()
         let previousPolicy = try? store.profilePolicy(named: previousName)
         let activated = try store.setActiveProfile(name: profileName)
@@ -437,9 +440,19 @@ public final class ProfileCoordinator: @unchecked Sendable {
         return tunnelConnected
     }
 
+    /// Consulted before a switch the user asked for (a pick or an undo).
+    /// Returns why it is refused, or nil to allow it. The helper sets it when
+    /// MDM locks the profile a managed trigger chose.
+    public var userSwitchRefusal: (() -> String?)?
+
+    /// Consulted before the user adds or removes a trigger. The helper sets
+    /// it when MDM manages the triggers.
+    public var triggerEditRefusal: (() -> String?)?
+
     public func setTunnelTrigger(_ trigger: TunnelTrigger) throws {
         switchSerial.lock()
         defer { switchSerial.unlock() }
+        if let refusal = triggerEditRefusal?() { throw ProfileValidationError.managedByOrganization(refusal) }
         _ = try store.setTunnelTrigger(trigger)
         reapplyTunnelStateLocked()
     }
@@ -447,12 +460,13 @@ public final class ProfileCoordinator: @unchecked Sendable {
     public func removeTunnelTrigger(id: String) throws {
         switchSerial.lock()
         defer { switchSerial.unlock() }
+        if let refusal = triggerEditRefusal?() { throw ProfileValidationError.managedByOrganization(refusal) }
         _ = try store.removeTunnelTrigger(id: id)
         reapplyTunnelStateLocked()
     }
 
     /// Applies the triggers to the known VPN state again, for when they
-    /// changed outside this coordinator.
+    /// changed outside this coordinator (an MDM update).
     public func reapplyTunnelState() {
         switchSerial.lock()
         defer { switchSerial.unlock() }

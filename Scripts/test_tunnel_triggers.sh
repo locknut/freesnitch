@@ -116,13 +116,18 @@ check("an unreadable list changes nothing on a VPN change", coordinator.applyObs
 check("and the gateway binding decides", coordinator.applyObservedGatewayMAC("aa:bb:cc:dd:ee:03") && coordinator.applyObservedGatewayMAC(officeMAC)
       && store.activeProfileName() == "Office")
 
+// 8. Edits can be refused (MDM).
 coordinator.tunnelTriggers = { try store.tunnelTriggers() }
+coordinator.triggerEditRefusal = { "VPN triggers are set by MDM" }
+do { try coordinator.setTunnelTrigger(TunnelTrigger(service: nil, whenConnected: true, profile: "Work")); check("a refused edit throws", false) }
+catch { check("a refused edit throws: \(error.localizedDescription)", true) }
 
 // 9. A named VPN whose service is completely absent (some clients remove
 //    their service when disconnected) is "not connected".
 let absent = TunnelTrigger(service: "CloudflareWARP", whenConnected: false, profile: "Restricted")
 check("a named VPN that is absent matches its not-connected trigger", absent.matches([]) && absent.matches([office]))
 check("and wins over any-VPN-not-connected", TunnelTrigger.winner([anyDown, absent], connected: []) == absent)
+coordinator.triggerEditRefusal = nil
 try coordinator.setTunnelTrigger(absent)
 _ = try coordinator.activate(profileName: "Office", reason: .user)
 check("with its service gone, the trigger switches", coordinator.applyObservedTunnelState([travel]) && store.activeProfileName() == "Restricted")

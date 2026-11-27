@@ -500,9 +500,12 @@ struct ProfilesSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Text(tunnelStateLabel).font(.caption).foregroundStyle(.secondary)
+            if tunnelTriggersManaged {
+                Text("Managed by your organization.").font(.caption).foregroundStyle(.secondary)
+            }
         }
         .controlSize(.small)
-        .disabled(!profileClient.isAvailable || profileClient.snapshot?.tunnelTriggers == nil)
+        .disabled(!profileClient.isAvailable || profileClient.snapshot?.tunnelTriggers == nil || tunnelTriggersManaged)
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
     }
@@ -536,6 +539,8 @@ struct ProfilesSettingsView: View {
         let candidate = TunnelTrigger(service: newTriggerService, whenConnected: newTriggerWhenConnected, profile: profile.name)
         return (profileClient.snapshot?.tunnelTriggers ?? []).first { $0.id == candidate.id && $0.profile != profile.name }
     }
+
+    private var tunnelTriggersManaged: Bool { profileClient.snapshot?.tunnelTriggersManaged == true }
 
     private var tunnelStateLabel: String {
         guard let connected = profileClient.snapshot?.tunnelConnected else {
