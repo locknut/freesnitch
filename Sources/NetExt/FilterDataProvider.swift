@@ -257,7 +257,7 @@ final class FilterDataProvider: NEFilterDataProvider {
             guard let self else {
                 return .unavailable("Network extension stopped before receiving the rule snapshot.")
             }
-            return self.receiveSnapshot(data, source: source)
+            return self.receiveSnapshot(data, from: source)
         }
         IPCConnection.shared.snapshotStatus = { [weak self] in
             self?.readSnapshotStatus()
@@ -1021,8 +1021,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
     }
 
-    private func receiveSnapshot(_ data: Data,
-                                 source: IPCConnection.SnapshotSource = .app) -> SharedRuleBridge.SnapshotStatus {
+    private func receiveSnapshot(_ data: Data, from source: IPCConnection.SnapshotSource = .app) -> SharedRuleBridge.SnapshotStatus {
         do {
             try RuleTransportBoundary.validateSnapshotBytes(data)
             let received = try SharedRuleBridge.decode(data)

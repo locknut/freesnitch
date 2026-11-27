@@ -210,13 +210,17 @@ public final class IPCConnection: NSObject, @unchecked Sendable {
 
 extension IPCConnection: NSXPCListenerDelegate {
     public func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+        // The helper is checked against its own, narrower requirement; every
+        // other peer must pass the GUI's.
         let fromHelper = XPCPeerValidator.isTrustedHelper(newConnection)
-        guard fromHelper || XPCPeerValidator.isTrustedGUI(newConnection) else {
-            PSLog.error(PSLog.netext,
-                        "SECURITY: rejected XPC peer failing the FreeSnitch GUI code requirement "
-                        + "(pid \(newConnection.processIdentifier)); no snapshot was accepted and "
-                        + "filtering will fail open if no trusted GUI is connected.")
-            return false
+        if !fromHelper {
+            guard XPCPeerValidator.isTrustedGUI(newConnection) else {
+                PSLog.error(PSLog.netext,
+                            "SECURITY: rejected XPC peer failing the FreeSnitch GUI code requirement "
+                            + "(pid \(newConnection.processIdentifier)); no snapshot was accepted and "
+                            + "filtering will fail open if no trusted GUI is connected.")
+                return false
+            }
         }
         // Extension side: the signed GUI connected. Export ProviderCommunication
         // and keep the connection so we can call promptUser on it later.
