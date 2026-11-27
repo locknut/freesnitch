@@ -9,6 +9,7 @@ public enum ProfileValidationError: Error, LocalizedError, Equatable, Sendable {
     case missingProfile(String)
     case missingBlocklist(UUID)
     case invalidGatewayMAC(String)
+    case invalidTunnelProfileSwitch(String)
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +29,8 @@ public enum ProfileValidationError: Error, LocalizedError, Equatable, Sendable {
             return String(localized: "The blocklist `\(id.uuidString)` does not exist.")
         case .invalidGatewayMAC(let detail):
             return String(localized: "Invalid gateway MAC address: \(detail).")
+        case .invalidTunnelProfileSwitch(let detail):
+            return String(localized: "The tunnel profile switch was not saved: \(detail).")
         }
     }
 }

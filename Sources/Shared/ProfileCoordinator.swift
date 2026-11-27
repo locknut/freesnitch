@@ -10,13 +10,20 @@ import Foundation
 ///    flows, and none may be added: `handleNewFlow` in the network extension is
 ///    the only consumer of a policy change.
 /// 2. Automatic switching happens only for a binding the user created with
-///    `bindCurrentNetwork(toProfile:)`. An unknown gateway leaves the active
-///    profile exactly where it is.
+///    `bindCurrentNetwork(toProfile:)`, or for the opt-in tunnel setting
+///    (`TunnelProfileSwitch`). An unknown gateway leaves the active profile
+///    exactly where it is.
+///
+/// While the tunnel setting names a profile for the current tunnel state, it
+/// takes precedence over gateway bindings: being inside the organisation's
+/// tunnel says more about where traffic goes than which router is nearby.
 public final class ProfileCoordinator: @unchecked Sendable {
     public enum SwitchReason: String, Sendable {
         case user
         case network
         case undo
+        /// A full tunnel (Cloudflare WARP) came up or went down.
+        case tunnel
     }
 
     public struct SwitchResult: Sendable {
@@ -54,6 +61,18 @@ public final class ProfileCoordinator: @unchecked Sendable {
     /// that has already read its binding can't land after a pick the user
     /// made meanwhile. Recursive because a network switch calls `activate`.
     private let switchSerial = NSRecursiveLock()
+    /// The debounced tunnel state last delivered, nil before the first one.
+    /// Only read and written while `switchSerial` is held.
+    private var tunnelUp: Bool?
+    /// The tunnel state whose switch is settled: applied, not needed, or
+    /// decided by the user picking a profile while in it. Mirrors
+    /// `settledGatewayMAC`.
+    private var settledTunnelUp: Bool?
+    /// The tunnel switch still owed because activating its profile failed.
+    private var pendingTunnel: (up: Bool, profile: String)?
+    /// Where the tunnel setting is read from. The store by default; the
+    /// helper replaces it when an MDM-managed value takes precedence.
+    public var tunnelSwitchSettings: () throws -> TunnelProfileSwitch
     /// Runs inside a network switch, after its binding was read and before it
     /// is applied. Only the profiles harness sets it, to replay a manual pick
     /// arriving at exactly that moment.
@@ -62,6 +81,7 @@ public final class ProfileCoordinator: @unchecked Sendable {
     public init(store: RuleStore, watcher: GatewayMACWatcher = GatewayMACWatcher()) {
         self.store = store
         self.watcher = watcher
+        self.tunnelSwitchSettings = { try store.tunnelProfileSwitch() }
     }
 
     /// Wiring point for the helper and the GUI: called after the active policy
@@ -163,7 +183,7 @@ public final class ProfileCoordinator: @unchecked Sendable {
         switch reason {
         case .undo:
             undoTarget = nil
-        case .user, .network:
+        case .user, .network, .tunnel:
             undoTarget = changed ? previousName : undoTarget
         }
         let canUndoNow = undoTarget != nil
@@ -186,11 +206,15 @@ public final class ProfileCoordinator: @unchecked Sendable {
         handler?(result)
         // The user's own choice settles the network they are on: a retry for
         // it, even one already on its way, must not undo what they picked.
-        if reason != .network {
+        if reason != .network && reason != .tunnel {
             lock.lock()
             let current = lastObservedGatewayMAC ?? ""
             lock.unlock()
             settledGatewayMAC = current
+            // The same for the tunnel: the user's pick holds until the tunnel
+            // really changes state.
+            settledTunnelUp = tunnelUp
+            pendingTunnel = nil
         }
         if reason != .network, let pendingSwitch = pendingNetworkSwitch {
             watcher.dropUndeliveredChange(for: pendingSwitch.gatewayMAC)
@@ -268,6 +292,16 @@ public final class ProfileCoordinator: @unchecked Sendable {
         // Already settled for this gateway (applied, or the user picked a
         // profile on it): a late or repeated delivery changes nothing.
         if settledGatewayMAC == mac { return true }
+        // The tunnel setting owns the active profile right now: remember the
+        // gateway (so a later unbound tunnel state can fall back to it) but
+        // do not switch for it.
+        if tunnelOwnsActiveProfile() {
+            lock.lock()
+            lastObservedGatewayMAC = rawMAC.flatMap(GatewayMAC.normalized)
+            lock.unlock()
+            settledGatewayMAC = mac
+            return true
+        }
         // Another gateway: whatever was settled belonged to the last one, and
         // coming back to it later is a real change again.
         settledGatewayMAC = nil
@@ -305,6 +339,84 @@ public final class ProfileCoordinator: @unchecked Sendable {
             }
             return false
         }
+    }
+
+    // MARK: - tunnel
+
+    /// Whether the tunnel setting names a profile for the tunnel state last
+    /// delivered. Callers hold `switchSerial`. An unreadable setting owns
+    /// nothing, so gateway bindings keep working.
+    private func tunnelOwnsActiveProfile() -> Bool {
+        guard let tunnelUp, let setting = try? tunnelSwitchSettings() else { return false }
+        return setting.target(tunnelUp: tunnelUp) != nil
+    }
+
+    /// The monitor's entry point, called with each debounced tunnel state.
+    /// Returns false when the switch it asked for failed; the caller retries
+    /// with the same state until it returns true or the state changes.
+    ///
+    /// With the setting off, or with no profile named for this state, the
+    /// gateway bindings decide, as they would without a tunnel at all.
+    @discardableResult
+    public func applyObservedTunnelState(_ up: Bool) -> Bool {
+        switchSerial.lock()
+        defer { switchSerial.unlock() }
+        let changed = tunnelUp != up
+        tunnelUp = up
+        if changed { settledTunnelUp = nil }
+        if settledTunnelUp == up { return true }
+        let setting: TunnelProfileSwitch
+        do {
+            setting = try tunnelSwitchSettings()
+        } catch {
+            PSLog.error(PSLog.helper, "The tunnel profile setting could not be read: \(error.localizedDescription). "
+                        + "Network bindings decide the profile until it can be read.")
+            return true
+        }
+        guard let target = setting.target(tunnelUp: up) else {
+            settledTunnelUp = up
+            pendingTunnel = nil
+            // Nothing is asked for this state, so the gateway decides again:
+            // the gateway seen last is applied as if it had just been seen.
+            if changed, setting.enabled {
+                settledGatewayMAC = nil
+                lock.lock()
+                let mac = lastObservedGatewayMAC
+                lock.unlock()
+                var bound: String?
+                _ = try? applyNetworkChange(mac, boundProfile: &bound)
+                settledGatewayMAC = mac ?? ""
+            }
+            return true
+        }
+        do {
+            if target != store.activeProfileName() {
+                let result = try activate(profileName: target, reason: .tunnel)
+                PSLog.notice(PSLog.helper, "The profile \(result.notice.activeProfile) is now active because "
+                             + "\(TunnelDefinition.cloudflareWARP.displayName) is \(up ? "connected" : "not connected").")
+            }
+            settledTunnelUp = up
+            pendingTunnel = nil
+            // A gateway settled while the tunnel owned the profile is decided
+            // again once the tunnel lets go of it.
+            settledGatewayMAC = nil
+            return true
+        } catch {
+            let first = pendingTunnel.map { $0.up != up || $0.profile != target } ?? true
+            pendingTunnel = (up, target)
+            if first {
+                PSLog.error(PSLog.helper, "Could not switch to the profile \(target) for the tunnel state "
+                            + "(\(up ? "connected" : "not connected")): \(error.localizedDescription). Retrying until it works.")
+            }
+            return false
+        }
+    }
+
+    /// The tunnel switch still owed, for status output.
+    public var pendingTunnelSwitch: (up: Bool, profile: String)? {
+        switchSerial.lock()
+        defer { switchSerial.unlock() }
+        return pendingTunnel
     }
 
     private func setPending(_ value: PendingNetworkSwitch?) {
