@@ -487,7 +487,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ],
             currentGatewayMAC: "a4:2b:8c:11:04:9f",
             notice: nil,
-            canUndo: false)
+            canUndo: false,
+            tunnelProfileSwitch: TunnelProfileSwitch(enabled: true, connectedProfile: work.name,
+                                                     disconnectedProfile: home.name),
+            tunnelConnected: false)
         ProfileClient.shared.adoptDemoSnapshot(snapshot)
     }
 
